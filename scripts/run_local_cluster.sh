@@ -12,6 +12,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DATA="$ROOT/.data"
 PIDS="$DATA/cluster.pids"
 PYTHON="${PYTHON:-python3}"
+# macOS 没有 setsid，此时只用 nohup
+SETSID=()
+command -v setsid > /dev/null && SETSID=(setsid)
 export POOL_DB_URL="${POOL_DB_URL:-sqlite+aiosqlite:///$DATA/pool.db}"
 
 cmd="${1:-start}"
@@ -26,7 +29,7 @@ case "$cmd" in
     cd "$ROOT"
     for port in "${ports[@]}"; do
       # 不经子 shell 直接后台启动，$! 即服务进程本身的 PID（setsid / nohup 都会 exec）
-      setsid nohup "$PYTHON" -m sandbox_pool --port "$port" < /dev/null > "$DATA/replica-$port.log" 2>&1 &
+      ${SETSID[@]+"${SETSID[@]}"} nohup "$PYTHON" -m sandbox_pool --port "$port" < /dev/null > "$DATA/replica-$port.log" 2>&1 &
       echo "$port $!" >> "$PIDS"
     done
     sleep 1
