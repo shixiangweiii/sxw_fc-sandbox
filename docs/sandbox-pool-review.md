@@ -3,6 +3,7 @@
 > 评审对象：提交 `412d59d`（服务主体）和 `56a849f`（本地集群、端到端脚本、设计文档），涵盖 `sandbox_pool/`、`scripts/`、`tests/`。
 > 评审方式：**只评审，不修改任何代码文件**。本报告是本次评审唯一新增的文件。
 > 相关文档：实施方案 `docs/sandbox-pool-plan.md`，设计说明 `docs/sandbox-pool-design.md`，改动说明 `docs/sandbox-pool-changes.md`。
+> **修复状态**：本报告的 19 个问题已全部修复，见 `docs/sandbox-pool-fix-plan.md`（方案）和 `docs/sandbox-pool-fix-changes.md`（逐条对照、测试与端到端结果）。本报告正文保留评审时的原始结论。
 
 ## 1. 结论摘要
 

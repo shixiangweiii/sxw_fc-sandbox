@@ -211,7 +211,7 @@ class Maintainer:
         try:
             await self.provider.pause(row["provider_id"])
         except Exception as e:  # noqa: BLE001
-            log.warning("pause %s failed: %s", row["provider_id"], e)
+            log.warning("pause %s failed: %r", row["provider_id"], e, exc_info=True)
             fresh = await self.store.get_sandbox(row["id"])
             if fresh and fresh["state"] == SandboxState.PAUSING.value and fresh["op_owner"] == self.replica_id:
                 await self.lc.destroy(fresh, f"pause failed: {e}")
@@ -256,7 +256,7 @@ class Maintainer:
                 await self.lc.destroy(fresh, "vanished from provider (keepalive)", background=True)
             return
         except Exception as e:  # noqa: BLE001
-            log.warning("keepalive %s failed: %s", row["provider_id"], e)
+            log.warning("keepalive %s failed: %r", row["provider_id"], e, exc_info=True)
             # 没续上：把到期时间改回去，下一轮重试
             await self.store.cas_sandbox(
                 row["id"],

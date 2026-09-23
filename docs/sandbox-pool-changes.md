@@ -62,6 +62,6 @@
 
 ## 6. 遗留事项
 
-评审发现的 19 个问题**本次没有修改**（按要求只评审），处理优先级见 `docs/sandbox-pool-review.md` 第 5 节。另外：
+评审发现的 19 个问题**本次没有修改**（按要求只评审），处理优先级见 `docs/sandbox-pool-review.md` 第 5 节。**后续已在下一轮全部修复**，见 `docs/sandbox-pool-fix-changes.md`。另外：
 - 第二代模板 `xu76gk97q07mgohgw7q3` 仍保留在账号里（它是模板，不是沙箱实例）。
 - 本地运行数据在 `.data/`（已被 gitignore），包含两轮端到端测试的日志。

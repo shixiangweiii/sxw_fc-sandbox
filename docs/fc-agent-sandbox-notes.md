@@ -7,6 +7,7 @@
 
 - **SDK 版本必须固定**：`e2b==2.31.0`、`e2b-code-interpreter==2.8.1`（官方验证版本）。`e2b` 2.51.0 走 `/v2/sandboxes`，云沙箱不支持创建和连接（实测返回 405）。
 - **代理**：E2B Python SDK 用自定义 httpx transport，**不读 `HTTPS_PROXY` 环境变量**，需要走 HTTP 代理出网时必须显式传 `proxy=...`。
+- **连接失效**：SDK 按事件循环共享一个 HTTP/2 连接池。经 HTTP 代理出网时，空闲约 1 分钟以上的连接会被断开，下一个请求报 `httpx.WriteError('')`（异常信息为空，请求未送达）。长期运行的服务需要对管控面调用做连接类错误重试（沙箱池已处理，见 `docs/sandbox-pool-fix-changes.md` 4.2）。
 - **账号内置模板**：只有 `base`、`code-interpreter-v1`（均为 2 vCPU / 2048 MB / 10 GB 磁盘）。browser、AIO、Desktop 等需要从官方镜像自行构建。
 - **创建耗时**：SDK 端到端约 2~2.5s。服务端响应头 `x-sandbox-creation-latency-service-ms` 约 785ms，其中 `createfcsession` 约 767ms。
 - **默认超时**：创建时不传 timeout 默认 300s；`get_info().end_at` = 创建时间 + timeout。

@@ -219,7 +219,7 @@ class Allocator:
         try:
             await self.provider.set_timeout(row["provider_id"], ttl + self.cfg.platform_timeout_margin_s)
         except Exception as e:  # noqa: BLE001 - 沙箱已失效，换一个
-            log.warning("ready sandbox %s unusable: %s", row["provider_id"], e)
+            log.warning("ready sandbox %s unusable: %r", row["provider_id"], e, exc_info=True)
             await self.lc.end_lease(lease["id"], LeaseState.FAILED, f"set_timeout failed: {e}")
             return None
         await self.lc.event(
@@ -245,7 +245,7 @@ class Allocator:
         try:
             await self.provider.resume(row["provider_id"], ttl + self.cfg.platform_timeout_margin_s)
         except Exception as e:  # noqa: BLE001
-            log.warning("resume %s failed: %s", row["provider_id"], e)
+            log.warning("resume %s failed: %r", row["provider_id"], e, exc_info=True)
             await self.lc.event("resume_failed", sandbox_row_id=row["id"], detail=str(e)[:500])
             fresh = await self.store.get_sandbox(row["id"])
             if fresh and fresh["state"] == SandboxState.RESUMING.value and fresh["op_owner"] == self.replica_id:

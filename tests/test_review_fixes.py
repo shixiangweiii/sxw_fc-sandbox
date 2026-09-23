@@ -580,3 +580,32 @@ async def test_init_schema_adds_new_columns_to_existing_db(db_url, tmp_path):
     assert "client_id" in {r[1] for r in con.execute("PRAGMA table_info(leases)")}
     assert "ix_events_pool_ts" in {r[1] for r in con.execute("PRAGMA index_list(events)")}
     con.close()
+
+
+# ---------------- 端到端回归发现：经代理的 HTTP/2 连接空闲后失效 ----------------
+
+
+async def test_provider_retries_once_on_stale_connection():
+    from sandbox_pool.provider.e2b_provider import _NOT_SENT_ERRORS, _retry_stale
+
+    calls = []
+
+    def flaky(exc):
+        async def call():
+            calls.append(1)
+            if len(calls) == 1:
+                raise exc
+            return "ok"
+
+        return call
+
+    assert await _retry_stale(flaky(httpx.WriteError(""))) == "ok" and len(calls) == 2
+    calls.clear()
+    assert await _retry_stale(flaky(httpx.ReadError(""))) == "ok" and len(calls) == 2
+    calls.clear()
+    with pytest.raises(httpx.ReadTimeout):  # 超时不重试，保证调用耗时不超过过渡态截止时间
+        await _retry_stale(flaky(httpx.ReadTimeout("")))
+    calls.clear()
+    with pytest.raises(httpx.ReadError):  # 创建不是幂等的：请求可能已送达时不重试
+        await _retry_stale(flaky(httpx.ReadError("")), retry_on=_NOT_SENT_ERRORS)
+    assert len(calls) == 1
