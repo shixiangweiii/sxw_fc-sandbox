@@ -1,9 +1,11 @@
-"""云沙箱（FC Agent Sandbox）生命周期验证 demo：创建 -> 验证 -> 暂停 -> 删除。
+"""云沙箱（FC Agent Sandbox）生命周期验证 demo：创建 -> 验证 -> 暂停 -> 恢复 -> 删除。
 
 凭据只从环境变量读取，不要写入代码或提交到仓库：
     export E2B_API_KEY="<your-api-key>"
     export E2B_API_URL="https://api.<region>.e2b.fc.aliyuncs.com"
     export E2B_DOMAIN="<region>.e2b.fc.aliyuncs.com"
+
+暂停 / 恢复需要第二代运行时模板（见 create_gen2_template.py），通过 SANDBOX_TEMPLATE 指定。
 
 运行：
     pip install -r requirements.txt   # 按官方文档固定 e2b==2.31.0，新版 SDK 的 /v2 接口云沙箱不支持
@@ -83,6 +85,12 @@ def main() -> int:
                 # 第一代运行时的暂停/恢复需账号开通白名单；第二代运行时（microVM）模板默认支持
                 print(f"    [FAIL] 暂停未开通: {e}")
                 print("    需开通暂停白名单，或改用第二代运行时模板（SANDBOX_TEMPLATE=<模板名>）")
+
+        if pause_ok:
+            with step("3.1 连接沙箱（自动恢复）并验证暂停前的文件仍在"):
+                resumed = Sandbox.connect(sandbox.sandbox_id, timeout=TIMEOUT_SECONDS, **conn)
+                print(f"    state  = {resumed.get_info().state}")
+                print(f"    file   = {resumed.files.read('/tmp/demo.txt')!r}")
 
         with step("4. 删除沙箱"):
             killed = Sandbox.kill(sandbox.sandbox_id, **conn)
