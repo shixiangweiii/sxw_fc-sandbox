@@ -95,16 +95,19 @@ curl -s -X DELETE localhost:8000/v1/leases/$LEASE -H "$H"          # 归还：�
 | GET | `/v1/leases/{id}` | 查询借用 |
 | POST | `/v1/leases/{id}/renew` `{ttl_s?}` | 续期（不超过借出后 60 分钟） |
 | DELETE | `/v1/leases/{id}` | 归还（返回时沙箱已销毁） |
-| POST | `/v1/leases/{id}/run_code` `{code, language?, timeout_s?}` | 返回 stdout、stderr、text、results（含图片）、error |
-| POST | `/v1/leases/{id}/commands` `{cmd, cwd?, envs?, timeout_s?}` | 返回 exit_code、stdout、stderr（退出码非 0 不视为错误） |
+| POST | `/v1/leases/{id}/run_code` `{code, language?, timeout_s?}` | 返回 stdout、stderr、text、results（含图片）、error。执行超时返回 200、`error.name=TimeoutError` |
+| POST | `/v1/leases/{id}/commands` `{cmd, cwd?, envs?, timeout_s?}` | 返回 exit_code、stdout、stderr（退出码非 0 不视为错误）。执行超时返回 200、`exit_code=-1`、`error` 以 `TimeoutError` 开头 |
 | PUT / GET | `/v1/leases/{id}/files?path=` | 上传 / 下载原始字节（上传默认上限 64 MiB） |
 | GET | `/v1/pool/stats` | 各状态数量、排队数、分配来源、各操作耗时 p50 / p99 |
-| GET | `/v1/sandboxes` | 调试（管理员） |
+| GET | `/v1/sandboxes` | 沙箱列表（管理员）。不含 `lease_id`，借出中的附带借用方和到期时间 |
+| DELETE | `/v1/sandboxes/{id}` | 强制销毁沙箱（管理员），借出中的先结束借用；用于处理卡住的借用 |
 | POST / DELETE | `/v1/admin/drain` | 排空 / 恢复（管理员） |
 | GET | `/healthz` | 健康检查（不鉴权） |
 
 - 借用只能由创建它的调用方操作，访问别人的借用返回 404。
-- 其他错误码：401 未认证、403 需要管理员、409 借用已结束、413 上传过大、502 沙箱侧错误。
+- 其他错误码：401 未认证、403 需要管理员、404 借用或沙箱不存在、409 借用已结束（或沙箱处于过渡态）、413 请求体过大、502 沙箱侧错误。
+- 代码或命令执行超时不是 502：代码可能已经执行了一部分，调用方不要自动重试。
+- 上传文件以外的请求体不超过 1 MiB（`POOL_MAX_BODY_BYTES`），在鉴权之前检查。
 
 ## 配置
 
@@ -115,11 +118,13 @@ curl -s -X DELETE localhost:8000/v1/leases/$LEASE -H "$H"          # 归还：�
 | `POOL_TEMPLATE` | `code-interpreter-v1` | 需要暂停时必须用第二代模板 |
 | `POOL_DB_URL` | `sqlite+aiosqlite:///./.data/pool.db` | 生产可换成 `postgresql+asyncpg://...` |
 | `POOL_API_KEYS` / `POOL_ADMIN_KEYS` | 空 | 「名称:key」，逗号分隔 |
-| `POOL_MAX_SIZE` / `POOL_TARGET_SIZE` / `POOL_MIN_HOT` | 5 / 5 / 0 | 容量上限 / 补货目标 / 保持运行的数量 |
+| `POOL_MAX_SIZE` / `POOL_TARGET_SIZE` / `POOL_MIN_HOT` | 5 / 5 / 0 | 容量上限 / 补货目标 / 保持运行的数量（设为 ≥1 可避免空闲后的首个请求等一次完整的暂停 + 恢复，约 16s） |
 | `POOL_IDLE_PAUSE_AFTER_S` | 60 | 空闲多久后暂停 |
 | `POOL_QUEUE_MAX` / `POOL_WAIT_TIMEOUT_S` | 10 / 180 | 排队上限 / 最长等待 |
 | `POOL_LEASE_TTL_S` / `POOL_LEASE_MAX_S` | 600 / 3600 | 借用期限 / 最长借用时间 |
 | `POOL_WARMUP_CODE` | `import numpy, pandas, matplotlib` | 预热代码 |
+| `POOL_OP_TIMEOUT_S` | 120 | 创建、预热、暂停的截止时间，必须大于 45（否则拒绝启动） |
+| `POOL_MAX_UPLOAD_BYTES` / `POOL_MAX_BODY_BYTES` | 64 MiB / 1 MiB | 上传文件 / 其余请求体的大小上限 |
 
 ## 测试
 
@@ -137,7 +142,7 @@ scripts/run_local_cluster.sh drain && scripts/run_local_cluster.sh stop
 python scripts/cleanup_sandboxes.py                # 兜底：销毁账号下全部沙箱并确认清空
 ```
 
-最近一轮结果：47 个单元测试连续多轮通过；3 副本端到端测试全部场景通过，包括两次真实的 `kill -9` 崩溃接管。详见 [`docs/sandbox-pool-fix-changes.md`](docs/sandbox-pool-fix-changes.md)。
+最近一轮结果（第二轮评审修复后）：60 个单元测试连续多轮通过；3 副本端到端测试全部场景通过，包括两次真实的 `kill -9` 崩溃接管、执行超时和管理员强制释放。详见 [`docs/sandbox-pool-r2-fix-changes.md`](docs/sandbox-pool-r2-fix-changes.md)。
 
 ## 实测数据（cn-hangzhou，第二代模板）
 
@@ -170,6 +175,7 @@ docs/           调研、方案、设计、评审与改动说明
 | [sandbox-pool-changes.md](docs/sandbox-pool-changes.md) | 首轮实现的改动说明 |
 | [sandbox-pool-review.md](docs/sandbox-pool-review.md) | 回归测试与代码评审（19 个问题） |
 | [sandbox-pool-fix-plan.md](docs/sandbox-pool-fix-plan.md) / [sandbox-pool-fix-changes.md](docs/sandbox-pool-fix-changes.md) | 评审问题修复方案与改动说明 |
+| [sandbox-pool-r2-fix-changes.md](docs/sandbox-pool-r2-fix-changes.md) | 第二轮评审的复核结论与修复说明 |
 
 ## 已知限制
 

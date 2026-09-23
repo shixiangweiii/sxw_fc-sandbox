@@ -10,7 +10,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 项目文档和代码注释都用中文，新增内容保持一致。设计与决策以 `docs/` 为准：
 - `sandbox-pool-design.md`：当前设计，是最权威的总览；
-- `sandbox-pool-fix-changes.md`：最近一轮修复，含踩坑记录；
+- `sandbox-pool-fix-changes.md`：第一轮评审的修复，含踩坑记录；
+- `sandbox-pool-r2-fix-changes.md`：第二轮评审的复核结论（哪些问题不成立、为什么）与修复；
 - `fc-agent-sandbox-notes.md`：云沙箱实测结论。
 
 `examples/` 是早期摸底脚本：生命周期 demo、通过 OpenAPI 创建第二代模板。
@@ -53,7 +54,7 @@ python scripts/cleanup_sandboxes.py       # 兜底：销毁账号下全部沙箱
   - 执行者崩溃后，其他副本在 `recover_stuck` 中接管。
   - 暂停、恢复途中崩溃的，按云端实际状态收回（`_adopt`）；其余销毁后补货。
   - 截止时间：创建 / 预热 / 暂停用 `op_timeout_s`，恢复用 `resume_timeout_s`，销毁用 `destroy_timeout_s`。
-  - `e2b_provider.py` 里各调用的请求超时必须小于对应的截止时间。
+  - `e2b_provider.py` 里各调用都要显式传请求超时（不依赖 SDK 默认的 60s），且小于对应的截止时间；启动时由 `check_deadlines` 校验配置，新增云端调用时要一并纳入。
 - 全池周期任务（对账、历史清理）用 `store.try_periodic` 在 `pool_kv` 时间戳上做 CAS，每个周期只有一个副本执行。
 - 排队在 `waiters` 表里，`seq` 决定先来先服务：
   - 「前面的人数 < 可分配沙箱数」时才去抢；
@@ -82,7 +83,9 @@ python scripts/cleanup_sandboxes.py       # 兜底：销毁账号下全部沙箱
 **鉴权**（`api/auth.py`）：
 - `POOL_API_KEYS` / `POOL_ADMIN_KEYS`，格式「名称:key」，逗号分隔。两者都为空时关闭鉴权，此时进程拒绝监听非回环地址（除非 `--allow-no-auth`）。
 - 借用按 `leases.client_id` 绑定调用方；allocator 方法的 `owner` 参数为 None 时表示管理员，不做归属限制。
-- 管理接口：`/v1/sandboxes`、`/v1/admin/drain`。
+- 管理接口：`GET /v1/sandboxes`（不含 `lease_id`，借出中的附带借用方和到期时间）、`DELETE /v1/sandboxes/{id}`（强制释放 / 销毁）、`/v1/admin/drain`。`lease_id` 是借用凭证，任何接口都不要返回给非借用方。
+- 上传文件以外的请求体由 `api/body_limit.py` 在鉴权之前限制大小（FastAPI 会在执行鉴权依赖之前读完 JSON 请求体）。
+- 代为执行超过 `timeout_s` 返回 200 + `TimeoutError`（`ExecutionTimeout`），不是 502：代码可能已执行，不能让调用方当故障重试。
 
 ## 测试约定
 
@@ -90,6 +93,6 @@ python scripts/cleanup_sandboxes.py       # 兜底：销毁账号下全部沙箱
   - 多次调用得到多个副本，它们共享同一个 SQLite 文件和同一个 `FakeProvider`（模拟共享的云端）。
   - `run_maintainer=False` 时可以手动调用 `maintainer.replenish(...)` 和 `lifecycle.wait_background()`，精确控制时序。
 - `FakeProvider` 可以模拟平台超时回收，并支持失败和延迟注入：`fail_create` / `fail_set_timeout` / `fail_kill` / `fail_resume_ids`、`latency_s` / `kill_latency_s` / `set_timeout_delays`。
-- `tests/test_review_fixes.py` 按评审问题编号（H1、M1…L10）组织。
+- `tests/test_review_fixes.py` 按第一轮评审问题编号（H1、M1…L10）组织，`tests/test_review_r2_fixes.py` 按第二轮编号（R2-*）组织。
   - 修并发问题时要构造出确定性的时序，并确认去掉修复后用例会失败。
   - 修完后全量连跑多轮，排查偶发失败。

@@ -8,6 +8,7 @@ import uvicorn
 
 from sandbox_pool.api.app import create_app
 from sandbox_pool.config import PoolConfig
+from sandbox_pool.provider.e2b_provider import check_deadlines
 
 
 def insecure_bind(host: str, cfg: PoolConfig) -> bool:
@@ -37,6 +38,10 @@ def main() -> None:
         format=f"%(asctime)s %(levelname)s [:{args.port}] %(name)s: %(message)s",
     )
     cfg = PoolConfig.from_env()
+    try:
+        check_deadlines(cfg)
+    except ValueError as e:
+        parser.error(str(e))
     if insecure_bind(args.host, cfg) and not args.allow_no_auth:
         parser.error(
             f"refusing to listen on {args.host} without authentication: "

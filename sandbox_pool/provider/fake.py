@@ -14,6 +14,7 @@ from typing import Optional
 from sandbox_pool.provider.base import (
     CodeResult,
     CommandResult,
+    ExecutionTimeout,
     ProviderSandbox,
     SandboxNotFound,
 )
@@ -34,6 +35,8 @@ class FakeProvider:
         self.fail_kill = 0
         # 依次作用于之后的 set_timeout 调用：先等待再生效，用于构造调用到达平台的先后顺序
         self.set_timeout_delays: list[float] = []
+        # 之后的 run_code / run_command 按剩余次数抛 ExecutionTimeout（模拟用户代码执行超时）
+        self.exec_timeouts = 0
 
     def _sweep(self) -> None:
         now = time.time()
@@ -80,7 +83,7 @@ class FakeProvider:
         )
         return sid
 
-    async def warmup(self, sandbox_id: str, code: str) -> None:
+    async def warmup(self, sandbox_id: str, code: str, *, sandbox_timeout_s: float) -> None:
         self.calls.append(("warmup", sandbox_id))
         if self.fail_warmup > 0:
             self.fail_warmup -= 1
@@ -136,8 +139,14 @@ class FakeProvider:
                 out.append(ProviderSandbox(sid, sb["state"], dict(sb["metadata"]), sb["started_at"]))
         return out
 
+    def _maybe_exec_timeout(self, timeout_s: float) -> None:
+        if self.exec_timeouts > 0:
+            self.exec_timeouts -= 1
+            raise ExecutionTimeout(f"execution exceeded {timeout_s:g}s")
+
     async def run_code(self, sandbox_id, code, *, language, timeout_s, sandbox_timeout_s) -> CodeResult:
         sb = self._running(sandbox_id)
+        self._maybe_exec_timeout(timeout_s)
         out = io.StringIO()
         error = None
         try:
@@ -149,6 +158,7 @@ class FakeProvider:
 
     async def run_command(self, sandbox_id, cmd, *, cwd, envs, timeout_s, sandbox_timeout_s) -> CommandResult:
         self._running(sandbox_id)
+        self._maybe_exec_timeout(timeout_s)
         if cmd.startswith("exit "):
             return CommandResult(exit_code=int(cmd.split()[1]), stdout="", stderr="failed")
         return CommandResult(exit_code=0, stdout=f"ran: {cmd}\n", stderr="")

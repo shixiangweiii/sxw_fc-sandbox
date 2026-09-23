@@ -8,6 +8,13 @@ class SandboxNotFound(Exception):
     """后端已不存在该沙箱。"""
 
 
+class ExecutionTimeout(Exception):
+    """代为执行（run_code / commands）超过调用方给的 timeout_s。
+
+    与后端故障不同：代码可能已经执行了一部分，调用方不能当作故障自动重试。
+    """
+
+
 @dataclass
 class ProviderSandbox:
     sandbox_id: str
@@ -36,7 +43,8 @@ class CommandResult:
 class SandboxProvider(Protocol):
     async def create(self, template: str, metadata: dict[str, str], timeout_s: float) -> str: ...
 
-    async def warmup(self, sandbox_id: str, code: str) -> None: ...
+    async def warmup(self, sandbox_id: str, code: str, *, sandbox_timeout_s: float) -> None:
+        """在新沙箱里执行预热代码。需要重新连接时按 sandbox_timeout_s 设置平台超时。"""
 
     async def pause(self, sandbox_id: str) -> None: ...
 

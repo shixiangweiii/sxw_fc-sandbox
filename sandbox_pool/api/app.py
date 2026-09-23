@@ -5,6 +5,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from sandbox_pool.api.auth import Authenticator
+from sandbox_pool.api.body_limit import BodyLimitMiddleware, BodyTooLarge, too_large_response
 from sandbox_pool.api.routes import router
 from sandbox_pool.config import PoolConfig
 from sandbox_pool.core.pool import SandboxPool
@@ -16,7 +17,9 @@ from sandbox_pool.models import (
     PoolDraining,
     PoolError,
     QueueFull,
+    SandboxBusy,
     SandboxOpError,
+    SandboxRecordNotFound,
     Unauthorized,
     WaitTimeout,
 )
@@ -26,7 +29,9 @@ _STATUS = {
     Unauthorized: 401,
     Forbidden: 403,
     LeaseNotFound: 404,
+    SandboxRecordNotFound: 404,
     LeaseNotActive: 409,
+    SandboxBusy: 409,
     PayloadTooLarge: 413,
     QueueFull: 429,
     SandboxOpError: 502,
@@ -67,6 +72,11 @@ def create_app(
     if pool is not None:
         app.state.pool = pool
     app.include_router(router)
+    app.add_middleware(BodyLimitMiddleware, max_body_bytes=config.max_body_bytes)
+
+    @app.exception_handler(BodyTooLarge)
+    async def _body_too_large(_request: Request, exc: BodyTooLarge):
+        return too_large_response(exc.detail)
 
     @app.exception_handler(PoolError)
     async def _pool_error(_request: Request, exc: PoolError):

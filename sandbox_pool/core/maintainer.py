@@ -257,14 +257,9 @@ class Maintainer:
             return
         except Exception as e:  # noqa: BLE001
             log.warning("keepalive %s failed: %r", row["provider_id"], e, exc_info=True)
-            # 没续上：把到期时间改回去，下一轮重试
-            await self.store.cas_sandbox(
-                row["id"],
-                [SandboxState.READY],
-                now=self.lc.now(),
-                expect_version=row["version"] + 1,
-                platform_deadline=row["platform_deadline"],
-            )
+            # 没续上：到期时间视为未知（None），下一轮立即重试。不带版本条件：期间别的副本可能改过版本，
+            # 带版本的回滚会静默失败，留下比实际更晚的到期时间，保活会长期跳过这个沙箱
+            await self.store.cas_sandbox(row["id"], [SandboxState.READY], now=self.lc.now(), platform_deadline=None)
             return
         fresh = await self.store.get_sandbox(row["id"])
         await self.lc.event("keepalive", sandbox_row_id=row["id"], duration_ms=(time.perf_counter() - t0) * 1000)
@@ -335,7 +330,7 @@ class Maintainer:
                 return
             if self.cfg.warmup_code:
                 t1 = time.perf_counter()
-                await self.provider.warmup(provider_id, self.cfg.warmup_code)
+                await self.provider.warmup(provider_id, self.cfg.warmup_code, sandbox_timeout_s=timeout)
                 await self.lc.event("warmup", sandbox_row_id=row["id"], duration_ms=(time.perf_counter() - t1) * 1000)
             now = self.lc.now()
             if await self.store.cas_sandbox(

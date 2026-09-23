@@ -76,9 +76,11 @@ class Lifecycle:
         if provider_id:
             try:
                 await self.provider.kill(provider_id)
-            except Exception:  # noqa: BLE001
-                # 保留 DESTROYING 记录，op_deadline（destroy_timeout_s）过后由维护循环重试
+            except Exception as e:  # noqa: BLE001
+                # 保留 DESTROYING 记录，op_deadline（destroy_timeout_s）过后由维护循环重试。
+                # 这期间仍占着容量（归还接口已经返回），记录事件以便在 /v1/pool/stats 里看到
                 log.exception("kill %s failed, will retry", provider_id)
+                await self.event("destroy_failed", sandbox_row_id=row_id, detail=f"{reason}: {e!r}"[:500])
                 return
         await self.store.delete_sandbox(row_id, expect_owner=self.replica_id)
         await self.event(

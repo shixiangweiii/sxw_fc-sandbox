@@ -21,7 +21,7 @@ from sandbox_pool.models import (
     WaiterState,
     WaitTimeout,
 )
-from sandbox_pool.provider.base import CodeResult, CommandResult, SandboxNotFound
+from sandbox_pool.provider.base import CodeResult, CommandResult, ExecutionTimeout, SandboxNotFound
 from sandbox_pool.store.repository import KV_DRAINING, Store
 from sandbox_pool.store.schema import sandboxes
 
@@ -103,7 +103,7 @@ class Allocator:
         if not self.cfg.strict_fifo and await self.store.count_waiting() == 0:
             grant = await self._try_claim(ttl, start, client_id)
             if grant:
-                return grant
+                return await self._hand_over(grant, None, is_disconnected)
             self.kick()
 
         seq = await self.store.enqueue(
@@ -148,11 +148,12 @@ class Allocator:
             await hb.stop()
 
     async def _hand_over(
-        self, grant: LeaseGrant, deadline: float, is_disconnected: Optional[Callable[[], Awaitable[bool]]]
+        self, grant: LeaseGrant, deadline: Optional[float], is_disconnected: Optional[Callable[[], Awaitable[bool]]]
     ) -> LeaseGrant:
+        """交付前最后确认请求方还在：已断开则立即归还，否则沙箱要占到借用过期。deadline 为 None 表示没有排队。"""
         # 排队记录已在抢到沙箱的同一事务内改为 GRANTED（抢的期间截止时间已到、被判超时的也一样），
         # 沙箱照常交给请求方，不销毁
-        if self.lc.now() > deadline:
+        if deadline is not None and self.lc.now() > deadline:
             log.info("lease %s granted after the waiting deadline", grant.lease_id)
             await self.lc.event("late_grant", sandbox_row_id=grant.sandbox_row_id, lease_id=grant.lease_id)
         if is_disconnected is not None and await is_disconnected():
@@ -221,6 +222,9 @@ class Allocator:
         except Exception as e:  # noqa: BLE001 - 沙箱已失效，换一个
             log.warning("ready sandbox %s unusable: %r", row["provider_id"], e, exc_info=True)
             await self.lc.end_lease(lease["id"], LeaseState.FAILED, f"set_timeout failed: {e}")
+            if waiter_seq is not None:
+                # 排队记录已在抢沙箱的同一事务内改为 GRANTED：改回 WAITING，继续排队换沙箱或等补货
+                await self.store.cas_waiter(waiter_seq, WaiterState.GRANTED, WaiterState.WAITING, lease_id=None)
             return None
         await self.lc.event(
             "acquire", sandbox_row_id=row["id"], lease_id=lease["id"], duration_ms=lease["wait_ms"], detail="ready"
@@ -313,7 +317,7 @@ class Allocator:
             # 借用已结束：顺手丢弃本副本缓存的连接（沙箱可能已被其他副本销毁）
             self.provider.forget(lease["sandbox_id"])
             raise LeaseNotActive(f"lease {lease_id} is {lease['state']}")
-        await self.store.touch_sandbox(lease["sandbox_row_id"], now)
+        # 不更新沙箱的 last_active_at：借出中的沙箱归还即销毁、不会回到 READY，该字段只对 READY 有意义
         return lease, lease["expires_at"] - now + self.cfg.platform_timeout_margin_s
 
     async def _guard(self, lease: dict, coro):
@@ -322,21 +326,32 @@ class Allocator:
         except SandboxNotFound as e:
             await self.lc.end_lease(lease["id"], LeaseState.FAILED, "sandbox vanished")
             raise SandboxOpError(f"sandbox {lease['sandbox_id']} not found") from e
-        except FileNotFoundError:
+        except (FileNotFoundError, ExecutionTimeout):
             raise
         except Exception as e:  # noqa: BLE001
             raise SandboxOpError(f"{type(e).__name__}: {e}") from e
+
+    async def _exec_timeout(self, lease: dict, kind: str, e: ExecutionTimeout) -> None:
+        """用户代码执行超时不是后端故障：调用方按代码抛出 TimeoutError 返回结果（200）而不是 502，
+        否则调用方会把它当成故障自动重试、重跑非幂等的代码。借用和沙箱都不受影响。"""
+        log.info("lease %s %s timed out: %s", lease["id"], kind, e)
+        await self.lc.event("exec_timeout", sandbox_row_id=lease["sandbox_row_id"], lease_id=lease["id"], detail=kind)
 
     async def run_code(
         self, lease_id: str, code: str, *, language: Optional[str], timeout_s: float, owner: Optional[str] = None
     ) -> CodeResult:
         lease, sb_timeout = await self._use(lease_id, owner)
-        return await self._guard(
-            lease,
-            self.provider.run_code(
-                lease["sandbox_id"], code, language=language, timeout_s=timeout_s, sandbox_timeout_s=sb_timeout
-            ),
-        )
+        try:
+            return await self._guard(
+                lease,
+                self.provider.run_code(
+                    lease["sandbox_id"], code, language=language, timeout_s=timeout_s, sandbox_timeout_s=sb_timeout
+                ),
+            )
+        except ExecutionTimeout as e:
+            await self._exec_timeout(lease, "run_code", e)
+            error = {"name": "TimeoutError", "value": str(e), "traceback": ""}
+            return CodeResult(stdout="", stderr="", text=None, results=[], error=error)
 
     async def run_command(
         self,
@@ -349,12 +364,16 @@ class Allocator:
         owner: Optional[str] = None,
     ) -> CommandResult:
         lease, sb_timeout = await self._use(lease_id, owner)
-        return await self._guard(
-            lease,
-            self.provider.run_command(
-                lease["sandbox_id"], cmd, cwd=cwd, envs=envs, timeout_s=timeout_s, sandbox_timeout_s=sb_timeout
-            ),
-        )
+        try:
+            return await self._guard(
+                lease,
+                self.provider.run_command(
+                    lease["sandbox_id"], cmd, cwd=cwd, envs=envs, timeout_s=timeout_s, sandbox_timeout_s=sb_timeout
+                ),
+            )
+        except ExecutionTimeout as e:
+            await self._exec_timeout(lease, "commands", e)
+            return CommandResult(exit_code=-1, stdout="", stderr="", error=f"TimeoutError: {e}")
 
     async def write_file(self, lease_id: str, path: str, data: bytes, *, owner: Optional[str] = None) -> None:
         lease, sb_timeout = await self._use(lease_id, owner)

@@ -74,6 +74,14 @@ class SandboxOpError(PoolError):
     pass
 
 
+class SandboxRecordNotFound(PoolError):
+    """池里没有这条沙箱记录（管理接口）。"""
+
+
+class SandboxBusy(PoolError):
+    """沙箱处于过渡态（创建、预热、暂停、恢复、销毁中），由执行中的副本负责，稍后重试。"""
+
+
 class PoolDraining(PoolError):
     """池子正在排空，不接受新的借用。"""
 

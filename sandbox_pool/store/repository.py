@@ -241,12 +241,6 @@ class Store:
 
         return await self._retry(fn)
 
-    async def touch_sandbox(self, row_id: str, now: float) -> None:
-        async def fn(conn):
-            await conn.execute(update(sandboxes).where(sandboxes.c.id == row_id).values(last_active_at=now))
-
-        await self._retry(fn)
-
     async def _grant_waiter(self, conn: AsyncConnection, seq: int, lease_id: str) -> None:
         """排队记录改为 GRANTED。已被判超时（抢沙箱期间截止时间到了）的也改：沙箱照常交给请求方。"""
         await conn.execute(
@@ -437,10 +431,20 @@ class Store:
         return await self._retry(fn)
 
     async def heartbeat(self, seq: int, now: float) -> bool:
+        """刷新排队心跳，返回排队记录是否仍然有效。
+
+        GRANTED 只会由请求自己抢到沙箱时写入：交付完成前、或抢到的沙箱不可用被改回 WAITING 前，仍算有效。
+        """
+
         async def fn(conn):
             res = await conn.execute(
                 update(waiters)
-                .where(and_(waiters.c.seq == seq, waiters.c.state == WaiterState.WAITING.value))
+                .where(
+                    and_(
+                        waiters.c.seq == seq,
+                        waiters.c.state.in_([WaiterState.WAITING.value, WaiterState.GRANTED.value]),
+                    )
+                )
                 .values(heartbeat_at=now)
             )
             return res.rowcount == 1

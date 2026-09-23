@@ -115,9 +115,14 @@ async def stats(request: Request):
 
 @router.get("/v1/sandboxes", dependencies=[Depends(require_admin)])
 async def list_sandboxes(request: Request):
-    """调试用，仅管理员。不返回 lease_id（借用凭证）。"""
-    rows = await _pool(request).store.list_sandboxes()
-    return [{k: v for k, v in r.items() if k != "lease_id"} for r in rows]
+    """仅管理员。不返回 lease_id（借用凭证）；借出中的沙箱附带借用方与到期时间（lease 字段）。"""
+    return await _pool(request).list_sandboxes()
+
+
+@router.delete("/v1/sandboxes/{row_id}", dependencies=[Depends(require_admin)])
+async def destroy_sandbox(row_id: str, request: Request):
+    """仅管理员。强制销毁沙箱（id 取自 GET /v1/sandboxes）：借出中的先结束借用。"""
+    return await _pool(request).destroy_sandbox(row_id)
 
 
 @router.post("/v1/admin/drain", dependencies=[Depends(require_admin)])

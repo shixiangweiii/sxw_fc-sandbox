@@ -69,10 +69,12 @@
 
    SQLite 下写事务本身是 `BEGIN IMMEDIATE`；Postgres 下 UPDATE 会拿行锁，语义一致。
 3. **调用云端接口时不持有数据库连接**：先 CAS 进入过渡态并写入 `op_owner` / `op_deadline`，调用完成后再 CAS 到目标状态。
+   - 每个云端调用都显式设置请求超时，且小于对应过渡态的截止时间：创建 30s、预热 45s、暂停 45s < `op_timeout_s`；connect + 探活 45s < `resume_timeout_s`；kill 20s < `destroy_timeout_s`。
+   - 进程启动时校验配置（`check_deadlines`），截止时间不大于这些值时拒绝启动，避免健康但较慢的调用被其他副本误判为卡死并接管。
 4. **排队也在库里**：`waiters` 表的自增 `seq` 决定先来先服务。
    - 排在前面的人数小于可分配沙箱数时，才可以去抢，多个沙箱同时可用时前几个请求可以并行抢。
-   - 抢到沙箱与排队记录改为 GRANTED 在同一事务内完成。
-   - 心跳由排队期间常驻的后台任务每秒刷新，抢沙箱（包括较慢的恢复）期间不中断。
+   - 抢到沙箱与排队记录改为 GRANTED 在同一事务内完成。抢到的 READY 沙箱不可用（续平台超时失败）时，排队记录改回 WAITING，继续排队换沙箱或等补货。
+   - 心跳由排队期间常驻的后台任务每秒刷新，抢沙箱（包括较慢的恢复）期间不中断。GRANTED 只会由请求自己写入，心跳同样视为有效。
    - 副本崩溃后，心跳超过 5s 未更新的排队记录会被清理。
 5. **对账**：全池每 60s 由一个副本执行（`pool_kv.reconcile_at` 上的时间戳 CAS 决定由谁执行）。按 `metadata.pool` 列出云端沙箱：
    - 云端有、库里没有的是孤儿，销毁（创建不满 60s 的跳过）。
@@ -80,6 +82,7 @@
 6. **READY 保活**：READY 沙箱的平台超时是短的兜底超时（空闲暂停时间 + 120s）。维护循环在剩余时间不足一半时续期，保证 `min_hot` 保留的热沙箱不被平台回收。
    - 保活先用版本号 CAS 占住这一行，调用平台后重读。
    - 若期间被借走，就按借用剩余时间重设平台超时，防止保活的短超时后到平台、覆盖借用方的超时。
+   - 调用失败时把 `platform_deadline` 清空（只带状态条件、不带版本条件），下一轮立即重试。带版本条件的回滚在期间有其他副本改过版本时会静默失败，留下比实际更晚的到期时间，保活会长期跳过这个沙箱。
 7. **后台任务绝不调用 `connect()`**：它会续期，对已暂停的沙箱还会直接恢复。状态查询一律用 `get_info()` / `list()`。
 8. **历史清理**：每小时由一个副本执行，删除已结束超过 7 天的排队、借用记录和事件。
 
@@ -95,13 +98,19 @@
 - `acquire`：
   - 队列为空时直接抢；否则入队（队列已满返回 429），轮到自己时再抢；等待超时返回 504。
   - 抢的过程中截止时间已到，也照常交付拿到的沙箱。
-  - 客户端断开时撤销排队（已拿到的借用随即归还）。
+  - 客户端断开时撤销排队。无论直接抢到还是排队抢到，交付前都会确认请求方还在，已断开就立即归还。
+  - 响应发出后请求方才断开的，服务端无法感知，借用会占到过期；管理员可以在 `GET /v1/sandboxes` 里按借用方和到期时间定位，用 `DELETE /v1/sandboxes/{id}` 强制释放。
   - `POOL_STRICT_FIFO=true` 时所有请求都先入队，队列上限改为「排队数 < `queue_max` + 可分配沙箱数」。
 - 借用期限默认 10 分钟，可续期，从借出算起最长 60 分钟（`hard_deadline`）。
   - 续期先调用平台 `set_timeout`，成功后再写库；平台失败返回 502，借用保持不变。
   - 过期由维护循环回收，条件 CAS（`expires_at <= now`）不会覆盖同时发生的续期。
 - 归还：等沙箱销毁完成再返回（约 0.3s），副本随后崩溃也不会占住容量。
+  - 销毁失败时（极少见）仍返回 200，沙箱停在 DESTROYING、继续占着容量，`destroy_timeout_s` 后由维护循环重试；记录 `destroy_failed` 事件，可在 `/v1/pool/stats` 里看到。
 - 平台侧的超时只作兜底：借出期间为「借用剩余时间 + 60s」（续期时同步）；空闲 READY 由保活续期。
+- 代为执行超时（超过请求里的 `timeout_s`）不是后端故障，不返回 502：
+  - `run_code` 返回 200，`error.name` 为 `TimeoutError`；`commands` 返回 200，`exit_code=-1`，`error` 以 `TimeoutError` 开头。
+  - 代码可能已经执行了一部分，调用方不要自动重试。借用和沙箱不受影响，记录 `exec_timeout` 事件。
+  - 在 `timeout_s` 用完之前就出现的超时（连接、请求超时）属于后端故障，仍返回 502。
 
 ## 6. HTTP 接口
 
@@ -113,17 +122,20 @@
 | GET | `/v1/leases/{id}` | 借用方 | 查询借用 |
 | POST | `/v1/leases/{id}/renew` `{ttl_s?}` | 借用方 | 续期（不超过 hard_deadline） |
 | DELETE | `/v1/leases/{id}` | 借用方 | 归还（返回时沙箱已销毁） |
-| POST | `/v1/leases/{id}/run_code` `{code, language?, timeout_s?}` | 借用方 | 返回 stdout、stderr、text、results（含 png 等）、error |
-| POST | `/v1/leases/{id}/commands` `{cmd, cwd?, envs?, timeout_s?}` | 借用方 | 返回 exit_code、stdout、stderr（退出码非 0 不算错误） |
+| POST | `/v1/leases/{id}/run_code` `{code, language?, timeout_s?}` | 借用方 | 返回 stdout、stderr、text、results（含 png 等）、error；执行超时时 `error.name=TimeoutError` |
+| POST | `/v1/leases/{id}/commands` `{cmd, cwd?, envs?, timeout_s?}` | 借用方 | 返回 exit_code、stdout、stderr（退出码非 0 不算错误）；执行超时时 `exit_code=-1`、`error` 以 `TimeoutError` 开头 |
 | PUT / GET | `/v1/leases/{id}/files?path=` | 借用方 | 请求体 / 响应体为原始字节；上传超过 `max_upload_bytes` 返回 413 |
 | GET | `/v1/pool/stats` | 调用方 | 各状态数量、排队数、分配来源、各操作耗时 p50/p99、是否排空 |
-| GET | `/v1/sandboxes` | 管理员 | 调试：沙箱记录（不含 `lease_id`） |
+| GET | `/v1/sandboxes` | 管理员 | 沙箱记录（不含 `lease_id`）；借出中的附带 `lease`：借用方 `client_id`、来源、借出时间、到期时间 |
+| DELETE | `/v1/sandboxes/{id}` | 管理员 | 强制销毁沙箱（`id` 取自上一行）：借出中的先结束借用（借用方之后访问返回 409），之后照常补货；过渡态返回 409 |
 | POST / DELETE | `/v1/admin/drain` | 管理员 | 排空 / 恢复 |
 | GET | `/healthz` | 无 | 健康检查 |
 
 「借用方」指创建该借用的调用方，管理员可以操作所有借用。访问别人的借用和借用不存在一样返回 404。
 
-错误码：401 未认证，403 需要管理员，409 借用已结束或已过期，413 上传过大，502 沙箱侧错误。
+错误码：401 未认证，403 需要管理员，404 借用或沙箱不存在，409 借用已结束或已过期、沙箱处于过渡态，413 请求体过大，502 沙箱侧错误。
+
+请求体大小：上传文件以外的请求体不超过 `max_body_bytes`（默认 1 MiB），在路由和鉴权之前检查（FastAPI 会在鉴权之前读完 JSON 请求体）。上传文件先鉴权，再按 `max_upload_bytes` 流式计数。
 
 ## 7. 配置（环境变量 `POOL_<字段名大写>`）
 
@@ -133,18 +145,19 @@
 | `POOL_DB_URL` | `sqlite+aiosqlite:///./.data/pool.db` | 生产可改为 `postgresql+asyncpg://...` |
 | `POOL_API_KEYS` / `POOL_ADMIN_KEYS` | 空 | 「名称:key」逗号分隔。都为空时关闭鉴权，此时进程拒绝监听非回环地址（除非 `--allow-no-auth`） |
 | `POOL_MAX_SIZE` / `POOL_TARGET_SIZE` | 5 / 5 | 容量上限 / 补货目标 |
-| `POOL_MIN_HOT` | 0 | 保持运行、不暂停的空闲数量 |
+| `POOL_MIN_HOT` | 0 | 保持运行、不暂停的空闲数量。设为 ≥1 可以避免「空闲一段时间后的第一个请求正好赶上全部沙箱在暂停」：进行中的暂停无法取消，只能等暂停完成再恢复（实测约 15s + 1s） |
 | `POOL_IDLE_PAUSE_AFTER_S` / `POOL_IDLE_PLATFORM_EXTRA_S` | 60 / 120 | 空闲多久后暂停 / READY 平台超时在此基础上多给的余量 |
 | `POOL_QUEUE_MAX` / `POOL_WAIT_TIMEOUT_S` | 10 / 180 | 排队上限 / 最长等待 |
 | `POOL_STRICT_FIFO` | false | 所有请求先入队 |
 | `POOL_LEASE_TTL_S` / `POOL_LEASE_MAX_S` | 600 / 3600 | 借用期限 / 最长借用时间 |
 | `POOL_MAX_AGE_S` | 21600 | 空闲或暂停的沙箱最长寿命 |
-| `POOL_OP_TIMEOUT_S` / `POOL_RESUME_TIMEOUT_S` / `POOL_DESTROY_TIMEOUT_S` | 120 / 60 / 30 | 过渡态截止时间（超时即被接管） |
+| `POOL_OP_TIMEOUT_S` / `POOL_RESUME_TIMEOUT_S` / `POOL_DESTROY_TIMEOUT_S` | 120 / 60 / 30 | 过渡态截止时间（超时即被接管）。必须分别大于 45 / 45 / 20（对应云端调用的请求超时），否则拒绝启动 |
 | `POOL_WARMUP_CODE` | `import numpy, pandas, matplotlib` | 预热代码；设为空字符串则不预热 |
 | `POOL_CREATE_FAIL_THRESHOLD` / `POOL_CREATE_COOLDOWN_S` | 3 / 60 | 连续创建失败熔断 |
 | `POOL_HISTORY_RETENTION_S` / `POOL_CLEANUP_INTERVAL_S` | 604800 / 3600 | 历史记录保留时间 / 清理周期 |
 | `POOL_HANDLE_CACHE_MAX` / `POOL_HANDLE_IDLE_TTL_S` | 64 / 600 | 连接句柄缓存上限 / 空闲淘汰时间 |
 | `POOL_MAX_UPLOAD_BYTES` | 67108864 | 上传文件大小上限 |
+| `POOL_MAX_BODY_BYTES` | 1048576 | 其余请求体（JSON）大小上限，在鉴权之前生效 |
 
 ## 8. 运行
 
@@ -170,4 +183,4 @@ python scripts/cleanup_sandboxes.py     # 兜底：销毁账号下全部沙箱�
 - 只支持一个模板；多模板需要把容量、队列、补货都按模板分片。
 - 自动加列只处理新增的可空列，生产环境建议用 Alembic 管理表结构。
 - 下载文件（`GET files`）仍整体读入内存，大文件可改为流式转发。
-- 平台侧单个沙箱的最长存活时间、暂停后的保留时长还未实测，`max_age_s` 先取 6 小时。
+- 已实测暂停中的沙箱不受 `timeout` 回收（超过 `end_at` 后仍可恢复，内存还在），所以 PAUSED 不需要续期、也不跟踪 `platform_deadline`。平台侧单个沙箱的最长存活时间还未实测，`max_age_s` 先取 6 小时。

@@ -3,13 +3,13 @@
 前置：scripts/run_local_cluster.sh start（默认 3 个副本 8001~8003）。
     python scripts/e2e_scenarios.py [--urls http://127.0.0.1:8001,...] [--kill-port 8003] [--api-key KEY]
     python scripts/e2e_scenarios.py --only min-hot      # 集群需以 POOL_MIN_HOT>0 启动
-开启鉴权时 --api-key（或环境变量 SANDBOX_POOL_API_KEY）需为管理员 key（场景 6b、8、9 使用管理接口）。
+开启鉴权时 --api-key（或环境变量 SANDBOX_POOL_API_KEY）需为管理员 key（场景 6b、8、9、10 使用管理接口）。
 
 场景：
-  0. 鉴权：不带 key 返回 401；调试接口不返回 lease_id
+  0. 鉴权：不带 key 返回 401；超限的请求体在鉴权前返回 413；调试接口不返回 lease_id
   1. 预热：池子补足 5 个并在空闲后全部暂停
   2. 突发：同时发 16 个借用请求 → 5 个立即拿到、10 个排队、1 个 429
-  3. 执行：在借到的沙箱上跑 run_code / commands / files，并验证沙箱之间互相隔离
+  3. 执行：在借到的沙箱上跑 run_code / commands / files，并验证沙箱之间互相隔离；执行超时返回 200 + TimeoutError
   4. 排队：逐个归还，排队请求依次拿到新沙箱
   5. 504：池满且无人归还时，等待超时返回 504
   6. 副本崩溃：通过某副本归还（归还即销毁完成）后立刻 kill -9 该副本，其余副本把池子恢复到 5 个
@@ -17,6 +17,7 @@
   7. 输出 /v1/pool/stats 统计
   8. 云端沙箱与池记录一致（无孤儿）
   9. 排空：管理接口排空后，库中和云端都没有该池的沙箱
+  10. 管理员强制释放：管理接口看到借用方和到期时间（不含 lease_id），强制释放后借用结束、池子补回（在 8 之前执行）
   min-hot：min_hot 保留的热沙箱超过平台空闲超时后仍是原来的沙箱、仍在运行，并能直接借出
 """
 
@@ -116,6 +117,8 @@ async def scenario_auth(c: Cluster) -> None:
         check(r.status_code == 401, "不带 API Key 访问返回 401")
         r = await anon.get(f"{c.urls[0]}/v1/pool/stats", headers={"Authorization": "Bearer wrong-key"})
         check(r.status_code == 401, "错误的 API Key 返回 401")
+        r = await anon.post(f"{c.urls[0]}/v1/leases/x/run_code", json={"code": "x" * (2 * 1024 * 1024)})
+        check(r.status_code == 413, "超过上限的请求体在鉴权之前就返回 413（R2-M5）")
     check((await c.stats())["config"]["auth_enabled"], "服务端已开启鉴权")
 
 
@@ -178,6 +181,26 @@ async def scenario_exec(c: Cluster, leases: list[dict]) -> None:
         r.raise_for_status()
         r = await c.client.get(f"{base}/files", params={"path": f"/tmp/marker-{i}"})
         check(r.content == payload, f"lease#{i} 文件写入/读取 64 字节一致")
+    await _exec_timeouts(c, leases[-1])
+
+
+async def _exec_timeouts(c: Cluster, lease: dict) -> None:
+    """R2-M11：用户代码执行超时返回 200 + TimeoutError，而不是 502；借用照常可用。"""
+    base = f"{c.next_url()}/v1/leases/{lease['lease_id']}"
+    t0 = time.perf_counter()
+    r = await c.client.post(f"{base}/run_code", json={"code": "import time\ntime.sleep(8)", "timeout_s": 3})
+    out = r.json()
+    check(r.status_code == 200 and (out.get("error") or {}).get("name") == "TimeoutError",
+          f"run_code 超时返回 200 + TimeoutError（{time.perf_counter() - t0:.1f}s）：{out}")
+    t0 = time.perf_counter()
+    r = await c.client.post(f"{base}/commands", json={"cmd": "sleep 8", "timeout_s": 3})
+    out = r.json()
+    check(r.status_code == 200 and out.get("exit_code") == -1 and str(out.get("error")).startswith("TimeoutError"),
+          f"commands 超时返回 200 + exit_code=-1（{time.perf_counter() - t0:.1f}s）：{out}")
+    t0 = time.perf_counter()
+    r = await c.client.post(f"{base}/run_code", json={"code": "print('alive')", "timeout_s": 30})
+    check(r.status_code == 200 and r.json()["stdout"].strip() == "alive",
+          f"超时后借用照常可用（下一次 run_code {time.perf_counter() - t0:.1f}s）")
 
 
 async def scenario_queue(c: Cluster, leases: list[dict], pending: list[asyncio.Task]) -> list[dict]:
@@ -277,6 +300,31 @@ async def scenario_kill_during_pause(c: Cluster) -> None:
     code, body, dt, _ = await c.acquire(wait_timeout_s=60)
     check(code == 200, f"接管后仍可借用（{dt:.1f}s，source={body.get('source')}）")
     await c.release(body["lease_id"])
+
+
+async def scenario_admin_force_release(c: Cluster) -> None:
+    log("场景 10：管理员定位并强制释放借用（R2-L6）")
+    code, lease, _, _ = await c.acquire(wait_timeout_s=60)
+    check(code == 200, f"借到沙箱 {lease.get('sandbox_id')}")
+    rows = await c.sandboxes()
+    row = next(r for r in rows if r["provider_id"] == lease["sandbox_id"])
+    check(row["state"] == "LEASED" and row["lease"]["client_id"] == lease["client_id"]
+          and row["lease"]["expires_at"] == lease["expires_at"] and lease["lease_id"] not in str(rows),
+          "管理接口能看到借用方和到期时间，仍不返回 lease_id")
+    r = await c.client.delete(f"{c.urls[0]}/v1/sandboxes/{row['id']}")
+    check(r.status_code == 200 and r.json()["lease_ended"], f"强制释放：{r.json()}")
+    got = (await c.client.get(f"{c.next_url()}/v1/leases/{lease['lease_id']}")).json()
+    r = await c.client.post(f"{c.next_url()}/v1/leases/{lease['lease_id']}/run_code", json={"code": "1"})
+    check(got["state"] == "RELEASED" and r.status_code == 409, "借用已结束，借用方之后的调用返回 409")
+    check(await _provider().get_state(lease["sandbox_id"]) is None, "云端沙箱已销毁")
+
+    async def healed():
+        sb = (await c.stats())["sandboxes"]
+        log(f"  sandboxes={sb}")
+        return sb.get("total") == TARGET and all(k in ("READY", "PAUSED", "total") for k in sb)
+
+    await wait_for(healed, timeout=300, interval=5, what="pool healed after force release")
+    check(True, "补货后池子恢复到 5 个")
 
 
 async def scenario_no_orphans(c: Cluster) -> None:
@@ -379,6 +427,7 @@ async def main() -> int:
         log(f"  events={stats['events']}")
         for kind, v in stats["latency_ms"].items():
             log(f"  {kind:<16} count={v['count']:<4} p50={v['p50']}ms p99={v['p99']}ms max={v['max']}ms")
+        await scenario_admin_force_release(c)
         await scenario_no_orphans(c)
         await scenario_drain(c)
         log("全部场景通过")

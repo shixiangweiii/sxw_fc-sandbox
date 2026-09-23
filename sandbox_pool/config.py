@@ -66,6 +66,8 @@ class PoolConfig:
     handle_idle_ttl_s: float = 600
     # 上传文件的大小上限
     max_upload_bytes: int = 64 * 1024 * 1024
+    # 其余请求体（JSON）的大小上限，在鉴权之前生效
+    max_body_bytes: int = 1024 * 1024
 
     @property
     def idle_platform_timeout_s(self) -> float:
