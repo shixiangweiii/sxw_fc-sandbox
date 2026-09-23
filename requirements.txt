@@ -1,3 +1,11 @@
+# 云沙箱 E2B 兼容：必须固定此版本（更新的 SDK 走 /v2 接口，云沙箱不支持）
 e2b==2.31.0
 e2b-code-interpreter==2.8.1
+# 第二代模板通过 OpenAPI 创建（examples/create_gen2_template.py）
 alibabacloud_fcsandbox20260509>=1.6.0
+# 沙箱池服务
+fastapi>=0.110
+uvicorn[standard]>=0.29
+sqlalchemy[asyncio]>=2.0
+aiosqlite>=0.21
+httpx>=0.27
