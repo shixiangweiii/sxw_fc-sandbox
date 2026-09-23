@@ -18,6 +18,10 @@
   - 暂停/恢复保留**内存状态**：解释器变量、后台进程（PID 不变）、文件都在。
   - 底层同样是 Dragonball 虚拟机，但没有 kata-containers 层，PID 1 为 `/usr/sbin/init`（systemd），并监听 22（sshd）和 49983（envd）。
 - **删除**：`kill()` 返回 True，之后 `get_info` 抛 `NotFoundException`。
+- **列表接口（`GET /v2/sandboxes`）**：
+  - 支持 `metadata=k%3Dv` 过滤。默认同时返回 running 和 paused。
+  - **有约 1～1.5s 延迟**：刚创建的沙箱、刚暂停的状态要过一会儿才出现在列表里。对账逻辑必须加宽限期，不能把「列表里暂时没有」当成「已经消失」。
+- **沙箱池实测（3 副本，5 个沙箱同时操作）**：并发暂停时单次约 15～16s（单个约 10s）；并发恢复约 2.2s；创建 p50 约 0.7s、p99 约 2.4s；预热 `import numpy, pandas, matplotlib` p50 约 2.1s。
 - **支持地域**：cn-beijing、cn-shanghai、cn-hangzhou、cn-shenzhen、cn-hongkong、ap-southeast-1、us-east-1、us-west-1（另有马来西亚柔佛）。
 - **Snapshot**：兼容，但需白名单且仅第二代运行时可用，默认保留 7 天（与下文「不支持」的检索摘要不同，以此为准）。
 
