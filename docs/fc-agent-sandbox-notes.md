@@ -1,7 +1,19 @@
 # 阿里云 云沙箱（FC Agent Sandbox）调研笔记
 
 > 目的：为后续基于云沙箱封装「沙箱池服务」做准备。
-> 说明：调研环境无法直连 help.aliyun.com，以下内容整理自官方文档的检索摘要。标记 **[待核实]** 的条目需要对照官方文档或实测确认。
+> 说明：初版整理自官方文档检索摘要，标记 **[待核实]** 的条目需要对照官方文档或实测确认。第 0 节为 cn-hangzhou 实测结论，优先级高于其余章节。
+
+## 0. 实测结论（cn-hangzhou，2026-09-23）
+
+- **SDK 版本必须固定**：`e2b==2.31.0`、`e2b-code-interpreter==2.8.1`（官方验证版本）。`e2b` 2.51.0 走 `/v2/sandboxes`，云沙箱不支持创建和连接（实测返回 405）。
+- **代理**：E2B Python SDK 用自定义 httpx transport，**不读 `HTTPS_PROXY` 环境变量**，需要走 HTTP 代理出网时必须显式传 `proxy=...`。
+- **账号内置模板**：只有 `base`、`code-interpreter-v1`（均为 2 vCPU / 2048 MB / 10 GB 磁盘）。browser、AIO、Desktop 等需要从官方镜像自行构建。
+- **创建耗时**：SDK 端到端约 2~2.5s。服务端响应头 `x-sandbox-creation-latency-service-ms` 约 785ms，其中 `createfcsession` 约 767ms。
+- **默认超时**：创建时不传 timeout 默认 300s；`get_info().end_at` = 创建时间 + timeout。
+- **暂停需要开通**：第一代运行时（内置模板）调用 `pause()` 返回 `pauseSession is not enabled for this function`，需账号开通白名单；第二代运行时（microVM）默认支持暂停/恢复，但第二代模板要通过阿里云 OpenAPI `CreateTemplate` 创建（`runtimeConfig.sandboxConfig.generation=2`，需要 AK/SK 和 `fcsandbox:CreateTemplate` 权限，E2B API Key 做不了）。
+- **删除**：`kill()` 返回 True，之后 `get_info` 抛 `NotFoundException`。
+- **支持地域**：cn-beijing、cn-shanghai、cn-hangzhou、cn-shenzhen、cn-hongkong、ap-southeast-1、us-east-1、us-west-1（另有马来西亚柔佛）。
+- **Snapshot**：兼容，但需白名单且仅第二代运行时可用，默认保留 7 天（与下文「不支持」的检索摘要不同，以此为准）。
 
 ## 1. 产品定位
 

@@ -6,7 +6,7 @@
     export E2B_DOMAIN="<region>.e2b.fc.aliyuncs.com"
 
 运行：
-    pip install -r requirements.txt
+    pip install -r requirements.txt   # 按官方文档固定 e2b==2.31.0，新版 SDK 的 /v2 接口云沙箱不支持
     python examples/sandbox_lifecycle_demo.py
 """
 
@@ -15,7 +15,7 @@ import sys
 import time
 from contextlib import contextmanager
 
-from e2b import NotFoundException
+from e2b import NotFoundException, SandboxException
 from e2b_code_interpreter import Sandbox
 
 TEMPLATE = os.environ.get("SANDBOX_TEMPLATE", "code-interpreter-v1")
@@ -43,9 +43,15 @@ def main() -> int:
         "api_url": require_env("E2B_API_URL"),
         "domain": require_env("E2B_DOMAIN"),
     }
+    # E2B SDK 使用自定义 httpx transport，不会读取 HTTPS_PROXY 环境变量，
+    # 需要走 HTTP 代理出网时要显式传入
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    if proxy:
+        conn["proxy"] = proxy
 
     sandbox = None
     killed = False
+    pause_ok = False
     try:
         with step(f"1. 创建沙箱 (template={TEMPLATE}, timeout={TIMEOUT_SECONDS}s)"):
             sandbox = Sandbox.create(
@@ -65,10 +71,18 @@ def main() -> int:
             print(f"    state  = {info.state}, started_at = {info.started_at}, end_at = {info.end_at}")
 
         with step("3. 暂停沙箱"):
-            paused = sandbox.pause()
-            print(f"    pause() 返回 {paused}")
-            info = Sandbox.get_info(sandbox.sandbox_id, **conn)
-            print(f"    state  = {info.state}")
+            try:
+                paused = sandbox.pause()
+                print(f"    pause() 返回 {paused}")
+                info = Sandbox.get_info(sandbox.sandbox_id, **conn)
+                print(f"    state  = {info.state}")
+                pause_ok = True
+            except SandboxException as e:
+                if "pauseSession is not enabled" not in str(e):
+                    raise
+                # 第一代运行时的暂停/恢复需账号开通白名单；第二代运行时（microVM）模板默认支持
+                print(f"    [FAIL] 暂停未开通: {e}")
+                print("    需开通暂停白名单，或改用第二代运行时模板（SANDBOX_TEMPLATE=<模板名>）")
 
         with step("4. 删除沙箱"):
             killed = Sandbox.kill(sandbox.sandbox_id, **conn)
@@ -81,6 +95,9 @@ def main() -> int:
             except NotFoundException:
                 print("    get_info 返回 NotFound，沙箱已删除")
 
+        if not pause_ok:
+            print("流程结束：创建/删除成功，暂停未通过")
+            return 2
         print("全部流程执行成功")
         return 0
     finally:
