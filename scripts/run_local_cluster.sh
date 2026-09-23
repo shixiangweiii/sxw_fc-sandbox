@@ -3,7 +3,9 @@
 #   scripts/run_local_cluster.sh start [端口...]   默认 8001 8002 8003
 #   scripts/run_local_cluster.sh stop
 #   scripts/run_local_cluster.sh status
+#   scripts/run_local_cluster.sh drain [端口]      排空：销毁空闲和已暂停的沙箱、停止补货（停集群前执行，避免沙箱留在云端）
 # 需要先导出 E2B_API_KEY / E2B_API_URL / E2B_DOMAIN 与 POOL_TEMPLATE 等配置。
+# 开启鉴权（POOL_API_KEYS / POOL_ADMIN_KEYS）时，drain 用 SANDBOX_POOL_API_KEY（管理员 key）调用管理接口。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -56,8 +58,24 @@ case "$cmd" in
       if kill -0 "$pid" 2>/dev/null; then echo ":$port pid=$pid alive"; else echo ":$port pid=$pid dead"; fi
     done < "$PIDS"
     ;;
+  drain)
+    port="${1:-8001}"
+    auth=()
+    [ -n "${SANDBOX_POOL_API_KEY:-}" ] && auth=(-H "Authorization: Bearer $SANDBOX_POOL_API_KEY")
+    curl -sSf -X POST ${auth[@]+"${auth[@]}"} "http://127.0.0.1:$port/v1/admin/drain" || { echo "drain request failed" >&2; exit 1; }
+    echo
+    # 等空闲和已暂停的沙箱销毁完；借出中的沙箱在归还或过期后销毁
+    for _ in $(seq 1 60); do
+      left=$(curl -sSf ${auth[@]+"${auth[@]}"} "http://127.0.0.1:$port/v1/pool/stats" \
+        | "$PYTHON" -c 'import json,sys; s=json.load(sys.stdin)["sandboxes"]; print(s.get("total",0)-s.get("LEASED",0))')
+      [ "$left" = "0" ] && break
+      sleep 2
+    done
+    curl -sSf ${auth[@]+"${auth[@]}"} "http://127.0.0.1:$port/v1/pool/stats" \
+      | "$PYTHON" -c 'import json,sys; s=json.load(sys.stdin); print("draining=%s sandboxes=%s" % (s["draining"], s["sandboxes"]))'
+    ;;
   *)
-    echo "usage: $0 start|stop|status [ports...]" >&2
+    echo "usage: $0 start|stop|status|drain [ports...]" >&2
     exit 1
     ;;
 esac

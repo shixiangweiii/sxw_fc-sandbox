@@ -59,7 +59,7 @@ class Lifecycle:
             expect_version=row["version"],
             state=SandboxState.DESTROYING,
             op_owner=self.replica_id,
-            op_deadline=now + self.cfg.op_timeout_s,
+            op_deadline=now + self.cfg.destroy_timeout_s,
             error=reason[:500],
         )
         if not ok:
@@ -77,7 +77,7 @@ class Lifecycle:
             try:
                 await self.provider.kill(provider_id)
             except Exception:  # noqa: BLE001
-                # 保留 DESTROYING 记录，op_deadline 过后由维护循环重试
+                # 保留 DESTROYING 记录，op_deadline（destroy_timeout_s）过后由维护循环重试
                 log.exception("kill %s failed, will retry", provider_id)
                 return
         await self.store.delete_sandbox(row_id, expect_owner=self.replica_id)
@@ -87,14 +87,29 @@ class Lifecycle:
         log.info("destroyed sandbox row=%s provider=%s reason=%s", row_id, provider_id, reason)
         self.on_change()
 
-    async def end_lease(self, lease_id: str, state: LeaseState, reason: str) -> bool:
-        """结束借用（归还 / 过期 / 失败），并销毁对应沙箱。"""
+    async def end_lease(
+        self,
+        lease_id: str,
+        state: LeaseState,
+        reason: str,
+        *,
+        expired_before: Optional[float] = None,
+        background: bool = True,
+    ) -> bool:
+        """结束借用（归还 / 过期 / 失败），并销毁对应沙箱。
+
+        expired_before：只在 expires_at <= 该时间时结束（过期回收用，不会覆盖同时发生的续期）。
+        background=False：等销毁完成再返回（归还接口用，副本随后崩溃也几乎不占容量）。
+        """
         lease = await self.store.get_lease(lease_id)
         if lease is None or lease["state"] != LeaseState.ACTIVE.value:
             return False
         now = self.now()
-        if not await self.store.cas_lease(lease_id, [LeaseState.ACTIVE], state=state, ended_at=now):
+        if not await self.store.cas_lease(
+            lease_id, [LeaseState.ACTIVE], expect_expired_at=expired_before, state=state, ended_at=now
+        ):
             return False
+        self.provider.forget(lease["sandbox_id"])
         now = self.now()
         ok = await self.store.cas_sandbox(
             lease["sandbox_row_id"],
@@ -103,11 +118,15 @@ class Lifecycle:
             expect_lease=lease_id,
             state=SandboxState.DESTROYING,
             op_owner=self.replica_id,
-            op_deadline=now + self.cfg.op_timeout_s,
+            op_deadline=now + self.cfg.destroy_timeout_s,
             error=reason[:500],
         )
         if ok:
-            self.spawn(self.finish_destroy(lease["sandbox_row_id"], lease["sandbox_id"], reason))
+            coro = self.finish_destroy(lease["sandbox_row_id"], lease["sandbox_id"], reason)
+            if background:
+                self.spawn(coro)
+            else:
+                await coro
         await self.event(
             "lease_" + state.value.lower(),
             sandbox_row_id=lease["sandbox_row_id"],

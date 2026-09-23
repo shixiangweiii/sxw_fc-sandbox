@@ -2,12 +2,11 @@ import asyncio
 import time
 
 from sandbox_pool.models import SandboxState
-from sandbox_pool.store.db import create_engine
 from sandbox_pool.store.repository import Store
 
 
 async def _stores(db_url, n=2):
-    stores = [Store(create_engine(db_url), "default") for _ in range(n)]
+    stores = [Store.open(db_url, "default") for _ in range(n)]
     await stores[0].init_schema()
     return stores
 
@@ -24,7 +23,7 @@ async def test_reserve_slot_never_exceeds_limit_across_engines(db_url):
     assert sum(r is not None for r in results) == 5
     assert (await stores[0].count_by_state()) == {SandboxState.CREATING.value: 5}
     for s in stores:
-        await s.engine.dispose()
+        await s.close()
 
 
 async def test_cas_rejects_stale_version(db_url):
@@ -35,7 +34,7 @@ async def test_cas_rejects_stale_version(db_url):
     assert not await store.cas_sandbox(row["id"], [SandboxState.WARMING], now=now, expect_version=0, state=SandboxState.READY)
     assert not await store.cas_sandbox(row["id"], [SandboxState.CREATING], now=now, state=SandboxState.READY)
     assert (await store.get_sandbox(row["id"]))["version"] == 1
-    await store.engine.dispose()
+    await store.close()
 
 
 async def test_enqueue_respects_queue_max_concurrently(db_url):
@@ -48,4 +47,4 @@ async def test_enqueue_respects_queue_max_concurrently(db_url):
     assert len(accepted) == 10
     assert await stores[0].head_seq() == min(accepted)
     for s in stores:
-        await s.engine.dispose()
+        await s.close()

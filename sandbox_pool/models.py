@@ -72,3 +72,19 @@ class LeaseNotActive(PoolError):
 
 class SandboxOpError(PoolError):
     pass
+
+
+class PoolDraining(PoolError):
+    """池子正在排空，不接受新的借用。"""
+
+
+class PayloadTooLarge(PoolError):
+    pass
+
+
+class Unauthorized(PoolError):
+    pass
+
+
+class Forbidden(PoolError):
+    pass

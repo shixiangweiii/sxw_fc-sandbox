@@ -22,6 +22,7 @@ class LeaseOut(BaseModel):
     hard_deadline: float
     ended_at: Optional[float] = None
     wait_ms: Optional[float] = None
+    client_id: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: dict) -> "LeaseOut":

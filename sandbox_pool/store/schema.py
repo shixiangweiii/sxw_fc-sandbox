@@ -29,6 +29,8 @@ sandboxes = Table(
     Column("op_owner", String(128)),
     Column("op_deadline", Float),
     Column("error", Text),
+    # READY 沙箱在平台上的到期时间（维护循环据此续期）；其他状态为空
+    Column("platform_deadline", Float),
     Index("ix_sandboxes_pool_state", "pool", "state"),
 )
 
@@ -46,6 +48,8 @@ leases = Table(
     Column("hard_deadline", Float, nullable=False),
     Column("ended_at", Float),
     Column("wait_ms", Float),
+    # 借用方身份（鉴权开启时为 key 的名称），只有借用方本人和管理员能操作
+    Column("client_id", String(64)),
     Index("ix_leases_pool_state", "pool", "state"),
 )
 
@@ -63,7 +67,7 @@ waiters = Table(
     Index("ix_waiters_pool_state", "pool", "state"),
 )
 
-# 共享键值：池级锁行、熔断计数等
+# 共享键值：池级锁行、熔断计数、周期任务的上次执行时间、排空开关等
 pool_kv = Table(
     "pool_kv",
     metadata,
@@ -85,4 +89,5 @@ events = Table(
     Column("duration_ms", Float),
     Column("detail", Text),
     Index("ix_events_pool_kind", "pool", "kind"),
+    Index("ix_events_pool_ts", "pool", "ts"),
 )

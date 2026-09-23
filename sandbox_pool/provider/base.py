@@ -71,4 +71,7 @@ class SandboxProvider(Protocol):
 
     async def read_file(self, sandbox_id: str, path: str, *, sandbox_timeout_s: float) -> bytes: ...
 
+    def forget(self, sandbox_id: str) -> None:
+        """丢弃本副本为该沙箱缓存的连接（借用已结束等场景）。"""
+
     async def close(self) -> None: ...
