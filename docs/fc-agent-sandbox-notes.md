@@ -15,6 +15,20 @@
 - **支持地域**：cn-beijing、cn-shanghai、cn-hangzhou、cn-shenzhen、cn-hongkong、ap-southeast-1、us-east-1、us-west-1（另有马来西亚柔佛）。
 - **Snapshot**：兼容，但需白名单且仅第二代运行时可用，默认保留 7 天（与下文「不支持」的检索摘要不同，以此为准）。
 
+### 0.1 与 E2B 的关系（实测取证）
+
+结论：**兼容 E2B 协议，实现不是 E2B 开源代码**。阿里在 FC 自有基础设施上重新实现了 E2B 的 API 和沙箱内协议。
+
+| 层 | E2B 开源（e2b-dev/infra） | 云沙箱实测 |
+| --- | --- | --- |
+| 控制面 REST API | E2B API + orchestrator | 兼容 E2B `/sandboxes` 等 v1 接口，不支持 `/v2`。响应头有 `x-sandboxgw-request-id`、`createfcsession` 耗时、`instanceid: c-…`；报错为 FC 的 `pauseSession is not enabled for this function`，说明一个沙箱就是一个 FC 函数会话 |
+| 虚拟化 | Firecracker microVM | 第一代：Dragonball（Kata/RunD）+ Alibaba Cloud Linux 内核 `5.10.134-…kangaroo.al8` + LifseaOS，`systemd.unit=kata-containers.target`；第二代为 microVM |
+| 沙箱内守护进程 envd | Go，`github.com/e2b-dev/infra/packages/envd`，依赖 connectrpc 等 | `/.fce2b/envd`，Go 模块路径为 `entrypoint/cmd/envd`，依赖只有 pty/fsnotify/zerolog/x/sys，**不含 e2b-dev 或 connectrpc**；版本号报 `0.5.2` 以通过 SDK 的版本检查 |
+| PID 1 | systemd 等 | `/.fce2b/entrypoint`（`entrypoint/cmd/gatewayd`） |
+| 代码解释器 | Python + Jupyter 服务 | `/.fce2b/sandbox-code-interpreter`，Go + gin 实现 |
+
+影响：兼容是「重新实现协议」，不是「同一套代码」，所以会有行为差异（`/v2` 接口不支持、暂停需白名单、metrics 为占位值）。要固定 SDK 版本，每次升级 SDK 都要回归；沙箱池应在 E2B SDK 之上加一层自己的抽象，以便对不同后端做差异适配。
+
 ## 1. 产品定位
 
 - 云沙箱是函数计算（FC）面向 **AI Agent 与代码执行场景** 的云端隔离运行环境。
