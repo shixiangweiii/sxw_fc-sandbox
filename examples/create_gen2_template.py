@@ -29,6 +29,10 @@ from alibabacloud_fcsandbox20260509.client import Client as FCSandboxClient
 from alibabacloud_tea_openapi import models as open_api_models
 
 BUILD_TIMEOUT_SECONDS = 900
+# 第二代运行时以 systemd 启动，不会自动拉起代码解释器服务（第一代由 /.fce2b/entrypoint 拉起），
+# 不设置时 run_code 会返回 500。通过启动 / 就绪命令在构建期启动服务并固化到模板快照。
+CODE_INTERPRETER_START = "/.fce2b/sandbox-code-interpreter"
+CODE_INTERPRETER_READY = "curl -sf http://127.0.0.1:49999/health > /dev/null"
 
 
 def require_env(name: str) -> str:
@@ -64,6 +68,7 @@ def create(args: argparse.Namespace) -> int:
 
     print(f"==> 创建第二代模板 name={name}")
     print(f"    image={image} cpu={args.cpu} memory={args.memory}MB disk={args.disk}MB")
+    print(f"    start_command={args.start_command!r} ready_command={args.ready_command!r}")
     resp = client.create_template(
         models.CreateTemplateRequest(
             body=models.CreateTemplateInput(
@@ -77,6 +82,8 @@ def create(args: argparse.Namespace) -> int:
                     sandbox_config=models.CreateTemplateSandboxConfig(
                         image=image,
                         generation=2,
+                        start_command=args.start_command or None,
+                        ready_command=args.ready_command or None,
                     ),
                 ),
             )
@@ -123,6 +130,10 @@ def main() -> int:
     parser.add_argument("--cpu", type=float, default=2)
     parser.add_argument("--memory", type=int, default=2048, help="内存 MB")
     parser.add_argument("--disk", type=int, default=15360, help="磁盘 MB（含镜像大小）")
+    parser.add_argument("--start-command", default=CODE_INTERPRETER_START,
+                        help="构建期后台启动的常驻进程，默认代码解释器；传空串不设置")
+    parser.add_argument("--ready-command", default=CODE_INTERPRETER_READY,
+                        help="就绪检查命令，退出码 0 即就绪；传空串不设置")
     d = sub.add_parser("delete", help="删除模板")
     d.add_argument("template_id")
     args = parser.parse_args()

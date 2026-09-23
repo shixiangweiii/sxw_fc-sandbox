@@ -11,6 +11,12 @@
 - **创建耗时**：SDK 端到端约 2~2.5s。服务端响应头 `x-sandbox-creation-latency-service-ms` 约 785ms，其中 `createfcsession` 约 767ms。
 - **默认超时**：创建时不传 timeout 默认 300s；`get_info().end_at` = 创建时间 + timeout。
 - **暂停需要开通**：第一代运行时（内置模板）调用 `pause()` 返回 `pauseSession is not enabled for this function`，需账号开通白名单；第二代运行时（microVM）默认支持暂停/恢复，但第二代模板要通过阿里云 OpenAPI `CreateTemplate` 创建（`runtimeConfig.sandboxConfig.generation=2`，需要 AK/SK 和 `fcsandbox:CreateTemplate` 权限，E2B API Key 做不了）。
+- **第二代模板实测（已验证可暂停/恢复）**：
+  - 创建：`examples/create_gen2_template.py` 通过 OpenAPI 用官方镜像 `code-interpreter-v1:v0.0.52` 建模板（2C/2G/15G），约 43s 就绪。E2B API Key 能直接用这个模板创建沙箱。
+  - **坑**：第二代运行时 PID 1 是 systemd，不会自动拉起代码解释器（第一代由 `/.fce2b/entrypoint` 拉起），`run_code` 一直返回 500。需要在模板上设置 `start_command=/.fce2b/sandbox-code-interpreter` 和 `ready_command=curl -sf http://127.0.0.1:49999/health`，脚本已默认设置。
+  - 耗时：创建约 1.6~2.2s，首次 `run_code` 约 2s；`pause()` 约 10~10.7s；`connect()` 恢复约 1.1~1.8s，恢复后首次 `run_code` 约 0.4s。
+  - 暂停/恢复保留**内存状态**：解释器变量、后台进程（PID 不变）、文件都在。
+  - 底层同样是 Dragonball 虚拟机，但没有 kata-containers 层，PID 1 为 `/usr/sbin/init`（systemd），并监听 22（sshd）和 49983（envd）。
 - **删除**：`kill()` 返回 True，之后 `get_info` 抛 `NotFoundException`。
 - **支持地域**：cn-beijing、cn-shanghai、cn-hangzhou、cn-shenzhen、cn-hongkong、ap-southeast-1、us-east-1、us-west-1（另有马来西亚柔佛）。
 - **Snapshot**：兼容，但需白名单且仅第二代运行时可用，默认保留 7 天（与下文「不支持」的检索摘要不同，以此为准）。

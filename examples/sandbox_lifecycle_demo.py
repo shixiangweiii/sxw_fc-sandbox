@@ -69,6 +69,8 @@ def main() -> int:
             print(f"    stdout = {result.stdout.strip()!r}")
             sandbox.files.write("/tmp/demo.txt", "fc agent sandbox")
             print(f"    file   = {sandbox.files.read('/tmp/demo.txt')!r}")
+            execution = sandbox.run_code("x = 40 + 2\nprint(x)")
+            print(f"    run_code x = {''.join(execution.logs.stdout).strip()}, error = {execution.error}")
             info = sandbox.get_info()
             print(f"    state  = {info.state}, started_at = {info.started_at}, end_at = {info.end_at}")
 
@@ -87,10 +89,13 @@ def main() -> int:
                 print("    需开通暂停白名单，或改用第二代运行时模板（SANDBOX_TEMPLATE=<模板名>）")
 
         if pause_ok:
-            with step("3.1 连接沙箱（自动恢复）并验证暂停前的文件仍在"):
+            with step("3.1 连接沙箱（自动恢复）并验证文件和内存状态仍在"):
                 resumed = Sandbox.connect(sandbox.sandbox_id, timeout=TIMEOUT_SECONDS, **conn)
                 print(f"    state  = {resumed.get_info().state}")
                 print(f"    file   = {resumed.files.read('/tmp/demo.txt')!r}")
+                # 暂停保存了内存状态，解释器里的变量在恢复后仍然可用
+                execution = resumed.run_code("print(x)")
+                print(f"    run_code x = {''.join(execution.logs.stdout).strip()}, error = {execution.error}")
 
         with step("4. 删除沙箱"):
             killed = Sandbox.kill(sandbox.sandbox_id, **conn)
