@@ -58,3 +58,36 @@ async def make_pool(db_url, provider):
     yield _make
     for pool in pools:
         await pool.stop()
+
+
+# agent 子系统的快速时间参数
+AGENT_FAST = dict(
+    agent_enabled=True,
+    agent_template="tpl-opencode",
+    agent_model_api_key="sk-test-key",
+    agent_boot_timeout_s=60,
+    agent_task_heartbeat_s=0.2,
+    agent_task_takeover_s=1.0,
+    agent_health_interval_s=0.2,
+    agent_wait_sandbox_s=10,
+    agent_stream_keepalive_s=0.5,
+)
+
+
+@pytest.fixture
+async def make_agents(db_url, provider):
+    """多次调用得到多个副本：共享同一个 SQLite 文件和同一个 FakeProvider（模拟共享的云端）。"""
+    from sandbox_pool.agent.service import AgentService
+
+    services = []
+
+    async def _make(*, run_maintainer: bool = True, **overrides):
+        cfg = PoolConfig(db_url=db_url, **{**FAST, **AGENT_FAST, **overrides})
+        svc = AgentService(cfg, provider)
+        await svc.start(run_maintainer=run_maintainer)
+        services.append(svc)
+        return svc
+
+    yield _make
+    for svc in services:
+        await svc.stop(grace_s=5)

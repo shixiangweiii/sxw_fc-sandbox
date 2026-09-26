@@ -184,3 +184,16 @@ python scripts/cleanup_sandboxes.py     # 兜底：销毁账号下全部沙箱�
 - 自动加列只处理新增的可空列，生产环境建议用 Alembic 管理表结构。
 - 下载文件（`GET files`）仍整体读入内存，大文件可改为流式转发。
 - 已实测暂停中的沙箱不受 `timeout` 回收（超过 `end_at` 后仍可恢复，内存还在），所以 PAUSED 不需要续期、也不跟踪 `platform_deadline`。平台侧单个沙箱的最长存活时间还未实测，`max_age_s` 先取 6 小时。
+
+## 10. agent 子系统（常驻 opencode agent）
+
+同一进程可选开启 agent 子系统（`POOL_AGENT_ENABLED=true`）：每个（调用方，用户）一个运行在云沙箱里的 opencode agent，与代码执行池共用 provider 和数据库，使用独立的池名（默认 `agents`）。
+- 设计与执行结果：`sxw_aicoding/方案设计/2026-09-25-opencode应用沙箱池-实施方案.md`；
+- 接入：`sxw_aicoding/2026-09-25-opencode常驻agent-业务接入使用手册.md`；
+- 测试：`sxw_aicoding/2026-09-25-opencode常驻agent-测试报告.md`。
+
+与代码执行池的主要差异：
+- 沙箱绑定到 agent，长期服务：ACTIVE → RETIRING → DESTROYING；不暂停（按 Eco 规则，最长 24h，20h 后空闲即轮换）；
+- 任务在后台 runner 里执行：客户端断开不影响，心跳过期由其他副本接管；
+- 出网规则（`network.rules` 凭证注入、白名单 / 黑名单）在创建时下发，运行中由 `update_network` 更新。
+

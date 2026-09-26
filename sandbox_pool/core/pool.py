@@ -83,7 +83,7 @@ class SandboxPool:
         active = {lease["sandbox_row_id"]: lease for lease in await self.store.list_leases([LeaseState.ACTIVE])}
         out = []
         for row in await self.store.list_sandboxes():
-            item = {k: v for k, v in row.items() if k != "lease_id"}
+            item = {k: v for k, v in row.items() if k not in ("lease_id", "access_token")}
             lease = active.get(row["id"])
             item["lease"] = None if lease is None else {k: lease[k] for k in _ADMIN_LEASE_FIELDS}
             out.append(item)

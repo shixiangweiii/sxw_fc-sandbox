@@ -6,6 +6,7 @@ import logging
 
 import uvicorn
 
+from sandbox_pool.agent.service import check_agent_config
 from sandbox_pool.api.app import create_app
 from sandbox_pool.config import PoolConfig
 from sandbox_pool.provider.e2b_provider import check_deadlines
@@ -40,6 +41,7 @@ def main() -> None:
     cfg = PoolConfig.from_env()
     try:
         check_deadlines(cfg)
+        check_agent_config(cfg)
     except ValueError as e:
         parser.error(str(e))
     if insecure_bind(args.host, cfg) and not args.allow_no_auth:

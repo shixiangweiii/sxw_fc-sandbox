@@ -12,6 +12,12 @@
 - **代为执行**：在借到的沙箱里执行 `run_code`、`commands`、文件读写。
 - **多副本高可用**：副本无状态，所有协调都通过数据库条件更新（CAS）完成，不需要选主。副本崩溃后，其他副本会接管它未完成的操作（按云端实际状态收回或销毁）、清理云端孤儿，并定期对账。本地用「多进程 + 共享 SQLite」模拟，生产可以换 Postgres。
 - **运维**：Bearer Token 鉴权（调用方 / 管理员两类 key，借用绑定到调用方）、排空接口、创建失败熔断、历史记录自动清理、`/v1/pool/stats` 耗时统计。
+- **常驻 opencode agent（agent 子系统，`POOL_AGENT_ENABLED=true`）**：每个用户一个运行在云沙箱里的 opencode agent（DeepSeek 模型、百炼联网搜索 MCP），通过 `/v1/agents/{user_id}/...` 调用：
+  - 支持同步流式对话、长任务断线重连、定时任务；
+  - 出网策略可配置，业务系统和 agent 都能读到当前策略；
+  - 模型与 MCP 的 Key 由平台在出网时注入，不进沙箱；
+  - 按 Eco 规则设计：沙箱最长 24h，自动轮换，支持空闲销毁。
+  - 接入方式见 [业务接入使用手册](sxw_aicoding/2026-09-25-opencode常驻agent-业务接入使用手册.md)。
 
 ## 架构
 
@@ -158,9 +164,10 @@ python scripts/cleanup_sandboxes.py                # 兜底：销毁账号下全
 ## 目录
 
 ```
-sandbox_pool/   服务代码：api/（路由、鉴权）、core/（分配、维护、生命周期）、store/（数据库）、provider/（沙箱后端）
-tests/          单元测试（FakeProvider）
-scripts/        本地多副本集群、端到端场景、沙箱清理
+sandbox_pool/   服务代码：api/（路由、鉴权）、core/（分配、维护、生命周期）、agent/（常驻 opencode agent）、store/（数据库）、provider/（沙箱后端）
+tests/          单元测试（FakeProvider、内存版 opencode）
+scripts/        本地多副本集群、端到端场景、沙箱清理、opencode 模板构建与云上验证
+sxw_aicoding/   agent 子系统的调研、方案、手册与测试报告
 examples/       云沙箱摸底：生命周期 demo、第二代模板创建
 docs/           调研、方案、设计、评审与改动说明
 ```
@@ -176,6 +183,9 @@ docs/           调研、方案、设计、评审与改动说明
 | [sandbox-pool-review.md](docs/sandbox-pool-review.md) | 回归测试与代码评审（19 个问题） |
 | [sandbox-pool-fix-plan.md](docs/sandbox-pool-fix-plan.md) / [sandbox-pool-fix-changes.md](docs/sandbox-pool-fix-changes.md) | 评审问题修复方案与改动说明 |
 | [sandbox-pool-r2-fix-changes.md](docs/sandbox-pool-r2-fix-changes.md) | 第二轮评审的复核结论与修复说明 |
+| [opencode 常驻 agent 实施方案](sxw_aicoding/方案设计/2026-09-25-opencode应用沙箱池-实施方案.md) | agent 子系统的设计（数据模型、状态机、出网策略、流式协议、定时任务）与执行结果 |
+| [opencode 调研](sxw_aicoding/技术调研/2026-09-25-opencode云沙箱常驻agent调研.md) / [PoC 验证报告](sxw_aicoding/技术调研/2026-09-25-opencode云沙箱PoC验证报告.md) | 业界方案、平台与 opencode 实测结论 |
+| [业务接入使用手册](sxw_aicoding/2026-09-25-opencode常驻agent-业务接入使用手册.md) / [测试报告](sxw_aicoding/2026-09-25-opencode常驻agent-测试报告.md) | agent 子系统的接入、配置、运维、排障与测试结果 |
 
 ## 已知限制
 

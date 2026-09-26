@@ -7,17 +7,20 @@
 import asyncio
 import contextlib
 import io
+import json
 import time
 import uuid
 from typing import Optional
 
 from sandbox_pool.provider.base import (
+    AppSandbox,
     CodeResult,
     CommandResult,
     ExecutionTimeout,
     ProviderSandbox,
     SandboxNotFound,
 )
+from sandbox_pool.provider.fake_opencode import FakeOpencodeClient, FakeOpencodeServer
 
 
 class FakeProvider:
@@ -37,12 +40,22 @@ class FakeProvider:
         self.set_timeout_delays: list[float] = []
         # 之后的 run_code / run_command 按剩余次数抛 ExecutionTimeout（模拟用户代码执行超时）
         self.exec_timeouts = 0
+        # agent 子系统：失败注入与调用记录
+        self.fail_create_app = 0
+        self.fail_update_network = 0
+        self.network_updates: list[tuple[str, dict]] = []
 
     def _sweep(self) -> None:
         now = time.time()
         for sid in [s for s, sb in self.sandboxes.items() if sb["state"] == "running" and sb["deadline"] <= now]:
-            del self.sandboxes[sid]
+            self._drop(sid)
             self.calls.append(("expired", sid))
+
+    def _drop(self, sandbox_id: str) -> bool:
+        sb = self.sandboxes.pop(sandbox_id, None)
+        if sb is not None and sb.get("opencode") is not None:
+            sb["opencode"].shutdown()
+        return sb is not None
 
     def _get(self, sandbox_id: str) -> dict:
         self._sweep()
@@ -123,7 +136,7 @@ class FakeProvider:
             self.fail_kill -= 1
             raise RuntimeError("injected kill failure")
         self._sweep()
-        return self.sandboxes.pop(sandbox_id, None) is not None
+        return self._drop(sandbox_id)
 
     async def get_state(self, sandbox_id: str) -> Optional[str]:
         self._sweep()
@@ -177,3 +190,44 @@ class FakeProvider:
 
     async def close(self) -> None:
         pass
+
+    # ---------- agent 子系统 ----------
+
+    async def create_app(self, template, metadata, timeout_s, *, port, network) -> AppSandbox:
+        self.calls.append(("create_app", template))
+        await self._sleep(self.latency_s)
+        if self.fail_create_app > 0:
+            self.fail_create_app -= 1
+            raise RuntimeError("injected create_app failure")
+        sid = await self.create(template, metadata, timeout_s)
+        self.calls.pop()  # create_app 已记录，不重复记 create
+        sb = self.sandboxes[sid]
+        sb["network"] = json.loads(json.dumps(network))
+        sb["access_token"] = uuid.uuid4().hex
+        sb["opencode"] = FakeOpencodeServer(sb["files"])
+        return AppSandbox(sid, f"https://{port}-{sid}.fake.local", sb["access_token"])
+
+    async def update_network(self, sandbox_id: str, network: dict) -> None:
+        self.calls.append(("update_network", sandbox_id))
+        if self.fail_update_network > 0:
+            self.fail_update_network -= 1
+            raise RuntimeError("injected update_network failure")
+        self._running(sandbox_id)["network"] = json.loads(json.dumps(network))
+        self.network_updates.append((sandbox_id, network))
+
+    async def get_network(self, sandbox_id: str):
+        sb = self._get(sandbox_id)
+        return {**sb.get("network", {}), "allow_public_traffic": False}
+
+    async def write_files(self, sandbox_id: str, files: dict, *, sandbox_timeout_s: float) -> None:
+        sb = self._running(sandbox_id)
+        for path, data in files.items():
+            sb["files"][path] = bytes(data)
+
+    def app_client(self, endpoint, access_token, directory, *, ingress_ip):
+        # endpoint 形如 https://4096-<sandbox_id>.fake.local
+        sandbox_id = endpoint.split("://", 1)[1].split(".", 1)[0].split("-", 1)[1]
+        return FakeOpencodeClient(self, sandbox_id, access_token, directory)
+
+    def opencode(self, sandbox_id: str) -> FakeOpencodeServer:
+        return self.sandboxes[sandbox_id]["opencode"]

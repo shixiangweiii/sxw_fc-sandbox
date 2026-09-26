@@ -40,8 +40,14 @@ class Lifecycle:
             await asyncio.gather(*self._tasks, return_exceptions=True)
 
     async def wait_background(self) -> None:
-        while self._tasks:
-            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+        # 只等还没结束的任务。任务刚结束时，从集合里移除它的 discard 回调只是排进了事件循环，还没执行；
+        # Python 3.12 起 gather 对已结束的任务直接返回、不让出事件循环，按「集合非空」循环会一直空转，
+        # 回调永远得不到执行，外层 wait_for 的超时也无法触发（停机卡死、CPU 100%，单测里实测）
+        while True:
+            pending = [t for t in self._tasks if not t.done()]
+            if not pending:
+                return
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def event(self, kind: str, **kw) -> None:
         try:

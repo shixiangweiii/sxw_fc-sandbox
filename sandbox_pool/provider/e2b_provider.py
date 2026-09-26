@@ -19,12 +19,14 @@ import time
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+import httpcore
 import httpx
 from e2b import NotFoundException, SandboxQuery, TimeoutException
 from e2b.sandbox.commands.command_handle import CommandExitException
 from e2b_code_interpreter import AsyncSandbox
 
 from sandbox_pool.provider.base import (
+    AppSandbox,
     CodeResult,
     CommandResult,
     ExecutionTimeout,
@@ -50,14 +52,23 @@ _PAUSE_TIMEOUT = 45  # 实测 10~18s，多个同时暂停时更慢
 # 执行超时的判定容差：调用方的 timeout_s 基本用完才算执行超时
 _EXEC_TIMEOUT_TOLERANCE_S = 0.5
 
-# 连接失效类错误：请求在失效的连接上发送失败或读不到响应，换一条连接重试即可
-_STALE_CONNECTION_ERRORS = (httpx.NetworkError, httpx.RemoteProtocolError)
+# 连接失效类错误：请求在失效的连接上发送失败或读不到响应，换一条连接重试即可。
+# envd 调用（commands / files）经 e2b_connect 直接抛 httpcore 的异常，不会被包成 httpx 异常（实测：刚创建的沙箱
+# TLS 握手被对端关闭，报 httpcore.ConnectError），两类都要算上
+_STALE_CONNECTION_ERRORS = (
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+    httpcore.NetworkError,
+    httpcore.RemoteProtocolError,
+)
 # 请求肯定没有到达服务端的错误：非幂等的创建只在这类错误时重试
-_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.WriteError)
+_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.WriteError, httpcore.ConnectError, httpcore.WriteError)
 
 
 # 连接失效后的重试间隔：同一条 HTTP/2 连接上的并发请求会一起失败，稍等让连接池丢弃坏连接
 _STALE_RETRY_DELAYS = (0.3, 1.0)
+# 幂等的文件写入（agent 装配）用更长的重试
+_WRITE_RETRY_DELAYS = (0.5, 1.0, 2.0, 3.0)
 
 
 def check_deadlines(cfg: "PoolConfig") -> None:
@@ -343,3 +354,59 @@ class E2BProvider:
 
     async def close(self) -> None:
         self._cache.clear()
+
+    # ---------- agent 子系统 ----------
+
+    async def create_app(self, template, metadata, timeout_s, *, port, network) -> AppSandbox:
+        h = await _retry_stale(
+            lambda: AsyncSandbox.create(
+                template=template,
+                timeout=int(timeout_s),
+                metadata=metadata,
+                secure=True,
+                network={**network, "allow_public_traffic": False},
+                request_timeout=_CREATE_TIMEOUT,
+                **self._opts,
+            ),
+            retry_on=_NOT_SENT_ERRORS,
+        )
+        self._cache.put(h.sandbox_id, h)
+        return AppSandbox(h.sandbox_id, f"https://{h.get_host(port)}", h.traffic_access_token)
+
+    async def update_network(self, sandbox_id: str, network: dict) -> None:
+        # 全量替换，重复调用结果相同，连接失效时可以重试
+        try:
+            await _retry_stale(
+                lambda: AsyncSandbox.update_network(sandbox_id, network, request_timeout=_API_TIMEOUT, **self._opts)
+            )
+        except NotFoundException as e:
+            raise SandboxNotFound(sandbox_id) from e
+
+    async def get_network(self, sandbox_id: str) -> Optional[dict]:
+        try:
+            info = await _retry_stale(
+                lambda: AsyncSandbox.get_info(sandbox_id, request_timeout=_API_TIMEOUT, **self._opts)
+            )
+        except NotFoundException as e:
+            raise SandboxNotFound(sandbox_id) from e
+        net = getattr(info, "network", None)
+        return dict(net) if net else None
+
+    async def write_files(self, sandbox_id: str, files: dict[str, bytes], *, sandbox_timeout_s: float) -> None:
+        h = await self._handle(sandbox_id, sandbox_timeout_s)
+        for path, data in files.items():
+            # 写文件是幂等的：连接类错误（刚创建时 envd 短暂不可达；本机代理 fake-ip 下新连接约 1/3 失败，实测）多重试几次
+            for delay in (*_WRITE_RETRY_DELAYS, None):
+                try:
+                    await h.files.write(path, data, request_timeout=_API_TIMEOUT)
+                    break
+                except _STALE_CONNECTION_ERRORS as e:
+                    if delay is None:
+                        raise
+                    log.info("write %s to %s failed (%r), retrying in %.1fs", path, sandbox_id, e, delay)
+                    await asyncio.sleep(delay)
+
+    def app_client(self, endpoint, access_token, directory, *, ingress_ip):
+        from sandbox_pool.agent.opencode import OpencodeHttpClient
+
+        return OpencodeHttpClient(endpoint, access_token, directory, ingress_ip=ingress_ip)

@@ -26,6 +26,18 @@
 - **支持地域**：cn-beijing、cn-shanghai、cn-hangzhou、cn-shenzhen、cn-hongkong、ap-southeast-1、us-east-1、us-west-1（另有马来西亚柔佛）。
 - **Snapshot**：兼容，但需白名单且仅第二代运行时可用，默认保留 7 天（与下文「不支持」的检索摘要不同，以此为准）。
 
+- **网络（2026-09-25 实测，opencode agent PoC，见 `sxw_aicoding/技术调研/2026-09-25-opencode云沙箱PoC验证报告.md`）**：
+  - **入站鉴权**：`allow_public_traffic=False`（须同时 `secure=True`）后，访问 `https://{port}-{sandbox_id}.{domain}` 不带 `e2b-traffic-access-token` 返回 403，带上返回 200。令牌只在 create / connect 时返回。
+  - **出网注入**：`network.rules` 的请求头注入对 curl 和 opencode（Bun）都生效，沙箱环境变量里看不到 Key。规则里的域名要同时出现在 `allow_out` 中。
+  - **`deny_out`**：只接受 IP / CIDR，带域名返回 400，与文档不符。按域名限制只能用白名单模式（`deny_out=["0.0.0.0/0"]` + `allow_out`），此时 DNS 仍可用。
+  - **`update_network`**：运行中修改立即生效（约 0.2s，全量替换，要带上 rules）。`get_info().network` 会明文回显注入值。
+  - **DNS**：DNS 服务器是 `100.100.2.136`，在 `100.64.0.0/10` 内。屏蔽元数据只能写 `100.100.100.200/32`，不能整段屏蔽。
+  - **本机代理的影响**：本机开着代理的 fake-ip / TUN 模式时，到沙箱域名的连接约 1/3 失败，直连入口 IP 则稳定；httpx 默认读系统代理，对沙箱域名返回 503。
+  - **envd 异常类型**：刚创建的沙箱，前几次 envd 调用可能抛 `httpcore.ConnectError`（经 e2b_connect，不是 httpx 异常）。
+- **第二代 code-interpreter 镜像环境**：
+  - 默认用户 user（sudo 组），x86_64，Debian 13，PID 1 为 systemd；
+  - 自带 git / python3 / pip3 / node / npm / curl / tar，没有 unzip。
+
 ### 0.1 与 E2B 的关系（实测取证）
 
 结论：**兼容 E2B 协议，实现不是 E2B 开源代码**。阿里在 FC 自有基础设施上重新实现了 E2B 的 API 和沙箱内协议。

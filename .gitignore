@@ -5,3 +5,6 @@
 __pycache__/
 .pytest_cache/
 .idea
+.venv/
+# 含明文 Token 的参考文件，勿入库
+sxw_aicoding/百炼-mcp.txt

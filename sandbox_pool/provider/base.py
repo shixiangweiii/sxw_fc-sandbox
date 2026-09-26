@@ -24,6 +24,15 @@ class ProviderSandbox:
 
 
 @dataclass
+class AppSandbox:
+    """对外提供服务的沙箱（agent 子系统）：服务地址与访问它必带的平台流量令牌。"""
+
+    sandbox_id: str
+    endpoint: str  # https://<port>-<sandbox_id>.<domain>
+    access_token: Optional[str]
+
+
+@dataclass
 class CodeResult:
     stdout: str
     stderr: str
@@ -83,3 +92,22 @@ class SandboxProvider(Protocol):
         """丢弃本副本为该沙箱缓存的连接（借用已结束等场景）。"""
 
     async def close(self) -> None: ...
+
+    # ---------- agent 子系统：对外提供服务的沙箱 ----------
+
+    async def create_app(
+        self, template: str, metadata: dict[str, str], timeout_s: float, *, port: int, network: dict
+    ) -> AppSandbox:
+        """创建沙箱：secure=True、关闭公开访问（访问端口必须带流量令牌）、下发出网规则（network，含凭证注入）。"""
+
+    async def update_network(self, sandbox_id: str, network: dict) -> None:
+        """运行中全量替换出网规则（allow_out / deny_out / rules）。"""
+
+    async def get_network(self, sandbox_id: str) -> Optional[dict]:
+        """平台回显的网络配置。注入的凭证是明文，调用方必须脱敏；沙箱不存在抛 SandboxNotFound。"""
+
+    async def write_files(self, sandbox_id: str, files: dict[str, bytes], *, sandbox_timeout_s: float) -> None:
+        """写入多个文件（幂等，连接类错误会重试）；需要重新连接时按 sandbox_timeout_s 设置平台超时。"""
+
+    def app_client(self, endpoint: str, access_token: Optional[str], directory: str, *, ingress_ip: Optional[str]):
+        """访问沙箱内 opencode server 的客户端（sandbox_pool.agent.opencode.OpencodeAPI）。"""

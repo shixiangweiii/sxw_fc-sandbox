@@ -55,3 +55,61 @@ class CommandResponse(BaseModel):
     stdout: str
     stderr: str
     error: Optional[str] = None
+
+
+# ---------- agent 子系统 ----------
+
+
+class MessageRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=200_000, description="发给 agent 的消息")
+    session_id: Optional[str] = Field(None, max_length=64, description="继续已有会话；为空时新建会话")
+    max_duration_s: Optional[float] = Field(None, ge=60, le=86400, description="最长执行时间，超过即中止（TIMEOUT）")
+    agent: Optional[str] = Field(None, max_length=64, description="opencode 的 agent（如 build / plan），默认 build")
+    stream: bool = Field(True, description="true：SSE 流式返回；false：等任务结束后返回 JSON")
+
+
+class TaskOut(BaseModel):
+    task_id: str
+    state: str
+    source: str
+    session_id: Optional[str] = None
+    schedule_id: Optional[str] = None
+    sandbox_row_id: Optional[str] = None
+    prompt: str
+    result: Optional[str] = None
+    error: Optional[str] = None
+    usage: Optional[dict] = None
+    created_at: float
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    deadline: float
+
+    @classmethod
+    def from_row(cls, row: dict) -> "TaskOut":
+        return cls(
+            task_id=row["id"],
+            result=row.get("result_text"),
+            **{k: row.get(k) for k in cls.model_fields if k not in ("task_id", "result")},
+        )
+
+
+class ScheduleIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=128)
+    prompt: str = Field(..., min_length=1, max_length=200_000)
+    cron: Optional[str] = Field(None, description="5 段 cron（分 时 日 月 周），与 every_s 二选一")
+    every_s: Optional[float] = Field(None, description="固定间隔秒数（>= 60），与 cron 二选一")
+    timezone: Optional[str] = Field(None, description="cron 的时区，默认 Asia/Shanghai")
+    enabled: Optional[bool] = True
+    max_duration_s: Optional[float] = None
+    overlap: Optional[str] = Field(None, description="skip（默认）：上一次还在运行时跳过；allow：照常触发")
+
+
+class SchedulePatch(BaseModel):
+    name: Optional[str] = None
+    prompt: Optional[str] = None
+    cron: Optional[str] = None
+    every_s: Optional[float] = None
+    timezone: Optional[str] = None
+    enabled: Optional[bool] = None
+    max_duration_s: Optional[float] = None
+    overlap: Optional[str] = None

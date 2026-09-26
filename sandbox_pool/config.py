@@ -69,6 +69,54 @@ class PoolConfig:
     # 其余请求体（JSON）的大小上限，在鉴权之前生效
     max_body_bytes: int = 1024 * 1024
 
+    # ---------- agent 子系统（每个用户一个常驻 opencode agent，见 sandbox_pool/agent/）----------
+    agent_enabled: bool = False
+    # 独立的池名：agent 沙箱的库记录与云端元数据 pool 都用它，与代码执行池互不影响
+    agent_pool_name: str = "agents"
+    # opencode 模板（第二代运行时，见 scripts/build_opencode_template.py）
+    agent_template: str = ""
+    agent_port: int = 4096
+    agent_workdir: str = "/home/user/workspace"
+    # 平台入口 IP（可选）：本机 DNS 被代理的 fake-ip 接管时，直连该 IP 访问沙箱端口（SNI / Host 仍用沙箱域名）。
+    # 取值：dig +short @223.5.5.5 api.<region>.e2b.fc.aliyuncs.com
+    agent_ingress_ip: str = ""
+    agent_model: str = "deepseek/deepseek-flash"
+    # 平台在出网时给该域名注入模型 Key（Authorization: Bearer），Key 不进沙箱
+    agent_model_host: str = "api.deepseek.com"
+    agent_model_api_key: str = field(default="", repr=False)
+    # 管理员配置的额外凭证注入：JSON {域名: {请求头: 值}}，值支持 ${ENV} 引用本进程环境变量
+    agent_inject: str = field(default="", repr=False)
+    # 默认 MCP 配置（opencode 的 mcp 段，JSON，不含密钥；密钥用 agent_inject 注入）
+    agent_mcp: str = ""
+    # 默认出网策略 JSON：{"mode": "open"|"allowlist", "allow_out": [...], "deny_out": [...]}
+    agent_egress: str = ""
+    # agent 沙箱总数上限；每个 agent 同时运行的任务上限
+    agent_max_sandboxes: int = 3
+    agent_max_running_tasks: int = 3
+    # 沙箱硬截止（Eco 单实例最长 24h，留余量）；超过 rotate_after 后空闲即轮换
+    agent_max_life_s: float = 23.5 * 3600
+    agent_rotate_after_s: float = 20 * 3600
+    # 新 agent 的默认空闲销毁时间，0 表示不因空闲销毁；定时任务唤醒后的空闲收尾时间
+    agent_idle_destroy_after_s: float = 0
+    agent_schedule_idle_tail_s: float = 600
+    # 单个任务最长执行时间（超过即中止，记为 TIMEOUT）
+    agent_task_max_duration_s: float = 4 * 3600
+    # CREATING / WARMING 的截止时间（超过即由其他副本接管销毁）
+    agent_boot_timeout_s: float = 180
+    # 平台侧兜底超时；维护循环在剩余不足一半时续期，最长到硬截止
+    agent_platform_timeout_s: float = 7200
+    agent_health_interval_s: float = 30
+    agent_health_max_failures: int = 3
+    # 请求等待沙箱就绪的时长
+    agent_wait_sandbox_s: float = 180
+    # 任务心跳：负责跟进任务的副本每隔多久刷新一次；超过 takeover 未刷新即由其他副本接管
+    agent_task_heartbeat_s: float = 10
+    agent_task_takeover_s: float = 60
+    # 对外 SSE 保活注释的间隔
+    agent_stream_keepalive_s: float = 15
+    # 已结束任务的保留时间（历史清理沿用 cleanup_interval_s 周期）
+    agent_task_retention_s: float = 30 * 86400
+
     @property
     def idle_platform_timeout_s(self) -> float:
         return self.idle_pause_after_s + self.idle_platform_extra_s
