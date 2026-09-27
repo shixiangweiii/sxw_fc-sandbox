@@ -1,18 +1,23 @@
-"""任务执行：订阅 opencode 事件 → （新建会话）→ prompt_async → 翻译事件并发布给订阅者 → 判定完成 → 结果落库。
+"""任务执行：订阅沙箱内 agent 的事件 → （新建会话）→ prompt_async → 翻译事件并发布给订阅者 → 判定完成 → 结果落库。
+
+事件翻译、结果提取随沙箱的引擎而定（agent/engines/）；控制流程对两种引擎相同。
 
 - 全部云端调用和写库都在 runner 自己的后台任务里；HTTP 响应端只从订阅队列读事件。客户端断开不会取消 runner，
   任务照常跑完、结果落库（也遵守「不在数据库操作中途取消协程」的约定）。
 - 负责跟进任务的副本每隔 agent_task_heartbeat_s 刷新 tasks.op_deadline；副本崩溃后其他副本在过期时接管（resume=True），
   只跟进到结束并落库。
-- 完成判定以事件为主（session.status 从 busy 回到 idle），同时定期轮询 /session/status 兜底（事件流断开、重连期间）。
+- 完成判定以事件为主（opencode：session.status 从 busy 回到 idle；pi：agent_settled），同时定期轮询 /session/status 兜底
+  （事件流断开、重连期间）。
+- 支持 run_id 的引擎（pi）：跟进结束后确认这次运行还在；沙箱内进程重启过（run 丢失）就记为失败，不把残缺结果当成功。
 """
 
 import asyncio
-import json
 import logging
 import time
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Optional
 
+# 旧名字：opencode 的事件翻译与结果提取已搬到 engines/opencode.py
+from sandbox_pool.agent.engines.opencode import Translator, extract_result  # noqa: F401
 from sandbox_pool.models import TaskState
 
 if TYPE_CHECKING:
@@ -20,169 +25,14 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-_TRUNCATE = 2000
 # 本副本内为后来的订阅者保留的事件数（断线重连时回放）。连续的同类文本增量合并成一条，长回复也只占很少几条
 _HISTORY_MAX = 5000
 _MERGEABLE = ("text", "reasoning")
 _STATUS_POLL_S = 5.0
 # prompt 之后多久还没见到 busy，就以 /session/status 为准判定完成（防止 busy / idle 事件都丢了的情况）
 _NO_BUSY_GRACE_S = 15.0
-
-
-def _cut(value: Any, limit: int = _TRUNCATE) -> Any:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        value = json.dumps(value, ensure_ascii=False)
-    return value if len(value) <= limit else value[:limit] + f"...(+{len(value) - limit} chars)"
-
-
-def _event_session(ev: dict) -> Optional[str]:
-    props = ev.get("properties") or {}
-    return (
-        props.get("sessionID")
-        or (props.get("part") or {}).get("sessionID")
-        or (props.get("info") or {}).get("sessionID")
-    )
-
-
-class Translator:
-    """把 opencode 事件翻译成对外事件：(kind, data)，kind ∈ text / reasoning / tool / status。
-
-    - 用户消息的部件（提示词本身）不输出：message.updated 先于对应部件到达，记下每条消息的角色；
-    - 文本增量来自 message.part.delta；部件类型未知时先缓存，等 message.part.updated 带来类型再发出；
-      只有 message.part.updated（没有增量）的文本，按已输出长度补发剩余部分；
-    - 工具部件在状态变化时输出（running / completed / error），输入输出截断。
-    """
-
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.roles: dict[str, str] = {}
-        self.part_types: dict[str, str] = {}
-        self.emitted: dict[str, int] = {}
-        self.pending: dict[str, list[str]] = {}
-        self.tool_status: dict[str, str] = {}
-        self.busy_seen = False
-        self.idle = False
-        self.errors: list[str] = []
-        self.asks: list[tuple[str, str]] = []  # (permission | question, request id)
-
-    def _emit_text(self, part_id: str, kind: str, delta: str, out: list) -> None:
-        if not delta:
-            return
-        self.emitted[part_id] = self.emitted.get(part_id, 0) + len(delta)
-        out.append((kind, {"delta": delta}))
-
-    def feed(self, ev: dict) -> list[tuple[str, dict]]:
-        out: list[tuple[str, dict]] = []
-        if _event_session(ev) != self.session_id:
-            return out
-        kind = ev.get("type")
-        props = ev.get("properties") or {}
-        if kind == "message.updated":
-            info = props.get("info") or {}
-            if info.get("id"):
-                self.roles[info["id"]] = info.get("role", "")
-        elif kind == "message.part.delta":
-            if self.roles.get(props.get("messageID")) == "user" or props.get("field", "text") != "text":
-                return out
-            part_id = props.get("partID", "")
-            ptype = self.part_types.get(part_id)
-            if ptype is None:
-                self.pending.setdefault(part_id, []).append(props.get("delta", ""))
-            elif ptype in ("text", "reasoning"):
-                self._emit_text(part_id, ptype, props.get("delta", ""), out)
-        elif kind == "message.part.updated":
-            part = props.get("part") or {}
-            if self.roles.get(part.get("messageID")) == "user":
-                return out
-            part_id, ptype = part.get("id", ""), part.get("type", "")
-            self.part_types[part_id] = ptype
-            if ptype in ("text", "reasoning"):
-                buffered = "".join(self.pending.pop(part_id, []))
-                self._emit_text(part_id, ptype, buffered, out)
-                full = part.get("text") or ""
-                done = self.emitted.get(part_id, 0)
-                if len(full) > done:
-                    self._emit_text(part_id, ptype, full[done:], out)
-            elif ptype == "tool":
-                state = part.get("state") or {}
-                status = state.get("status")
-                if status in ("running", "completed", "error") and self.tool_status.get(part_id) != status:
-                    self.tool_status[part_id] = status
-                    out.append(
-                        (
-                            "tool",
-                            {
-                                "tool": part.get("tool"),
-                                "status": status,
-                                "title": state.get("title"),
-                                "input": _cut(state.get("input")),
-                                "output": _cut(state.get("output")) if status == "completed" else None,
-                                "error": _cut(state.get("error")) if status == "error" else None,
-                            },
-                        )
-                    )
-            else:
-                self.pending.pop(part_id, None)
-        elif kind == "session.status":
-            status = props.get("status") or {}
-            st = status.get("type")
-            if st == "busy":
-                self.busy_seen = True
-            elif st == "retry":
-                self.busy_seen = True
-                out.append(("status", {"type": "retry", "message": _cut(status.get("message"), 500), "attempt": status.get("attempt")}))
-            elif st == "idle" and self.busy_seen:
-                self.idle = True
-        elif kind == "session.error":
-            err = props.get("error") or {}
-            msg = (err.get("data") or {}).get("message") or err.get("name") or "session error"
-            self.errors.append(_cut(msg, 1000))
-        elif kind in ("permission.asked", "question.asked"):
-            if props.get("id"):
-                self.asks.append((kind.split(".")[0], props["id"]))
-        return out
-
-    def flush(self) -> list[tuple[str, dict]]:
-        """结束时仍未确定类型的缓存增量按文本输出。"""
-        out: list[tuple[str, dict]] = []
-        for part_id, chunks in list(self.pending.items()):
-            self._emit_text(part_id, "text", "".join(chunks), out)
-        self.pending.clear()
-        return out
-
-
-def extract_result(messages: list[dict]) -> tuple[str, dict, Optional[str]]:
-    """本轮结果：最后一条用户消息之后的 assistant 消息。文本取最后一条有文本的 assistant 消息，用量求和，错误取最后一条。
-
-    按消息顺序而不是时间戳划分，不依赖网关与沙箱之间的时钟。
-    """
-    last_user = -1
-    for i, m in enumerate(messages):
-        if (m.get("info") or {}).get("role") == "user":
-            last_user = i
-    assistants = [m for m in messages[last_user + 1 :] if (m.get("info") or {}).get("role") == "assistant"]
-    usage = {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0, "cost": 0.0, "steps": len(assistants)}
-    text, error = "", None
-    for m in assistants:
-        info = m.get("info") or {}
-        tok = info.get("tokens") or {}
-        cache = tok.get("cache") or {}
-        usage["input"] += tok.get("input") or 0
-        usage["output"] += tok.get("output") or 0
-        usage["reasoning"] += tok.get("reasoning") or 0
-        usage["cache_read"] += cache.get("read") or 0
-        usage["cache_write"] += cache.get("write") or 0
-        usage["cost"] += info.get("cost") or 0
-        parts = [p.get("text") or "" for p in m.get("parts") or [] if p.get("type") == "text"]
-        if any(parts):
-            text = "".join(parts)
-        err = info.get("error")
-        if err:
-            error = (err.get("data") or {}).get("message") or err.get("name") or "error"
-    usage["cost"] = round(usage["cost"], 8)
-    return text, usage, error
+# run 查询结果：这次运行已不存在（沙箱内进程或桥接进程重启过）
+_RUN_GONE = ("lost", "unknown")
 
 
 class _LostOwnership(Exception):
@@ -208,8 +58,10 @@ class TaskRunner:
         self.text = text
         self.agent_name = agent_name
         self.resume = resume
+        self.engine = svc.engine_for(sandbox)
         self.client = svc.client_for(sandbox)
         self.session_id: Optional[str] = task.get("session_id")
+        self.run_id: Optional[str] = task.get("run_id")
         self.subscribers: set[asyncio.Queue] = set()
         self.history: list[tuple[str, dict]] = []
         self.done = asyncio.Event()
@@ -313,7 +165,13 @@ class TaskRunner:
                     "start",
                     {"task_id": self.task_id, "session_id": self.session_id, "sandbox_id": self.sandbox["id"]},
                 )
-                await self.client.prompt_async(self.session_id, self.text or "", model=None, agent=self.agent_name)
+                self.run_id = await self.client.prompt_async(
+                    self.session_id, self.engine.prompt_text(self.text or ""), model=None, agent=self.agent_name
+                )
+                if self.run_id and not await self.svc.store.cas_task(
+                    self.task_id, [TaskState.RUNNING], expect_owner=self.svc.replica_id, run_id=self.run_id
+                ):
+                    raise _LostOwnership()
             else:
                 self._publish(
                     "start",
@@ -347,11 +205,11 @@ class TaskRunner:
             try:
                 ev = await asyncio.wait_for(queue.get(), timeout=max(0.1, deadline - time.monotonic()))
             except asyncio.TimeoutError:
-                raise RuntimeError("opencode event stream not connected within 30s") from None
+                raise RuntimeError("agent event stream not connected within 30s") from None
             if ev.get("type") == "server.connected":
                 return
             if ev.get("type") == "__stream_error__" and time.monotonic() > deadline:
-                raise RuntimeError(f"opencode event stream unavailable: {ev['properties']['error']}")
+                raise RuntimeError(f"agent event stream unavailable: {ev['properties']['error']}")
 
     async def _check_abort(self, *, poll_db: bool) -> None:
         """超过最长执行时间或收到中止请求时中止 opencode 会话。
@@ -382,7 +240,7 @@ class TaskRunner:
                 log.warning("task %s: abort failed: %r", self.task_id, e)
 
     async def _follow(self, queue: asyncio.Queue, reader: asyncio.Task) -> Optional[tuple]:
-        tr = Translator(self.session_id)
+        tr = self.engine.translator(self.session_id)
         started = time.monotonic()
         next_poll = started + _STATUS_POLL_S
         if self.resume:
@@ -425,8 +283,12 @@ class TaskRunner:
             # （请求落在其他副本时，库里的 abort_requested 每轮状态轮询才查一次）
             self._abort_reason = TaskState.ABORTED
         messages = await self.client.messages(self.session_id)
-        text, usage, error = extract_result(messages)
+        text, usage, error = self.engine.extract_result(messages)
         error = error or (tr.errors[-1] if tr.errors else None)
+        if error is None and self.engine.has_runs and self.run_id:
+            state = await self.client.run_state(self.session_id, self.run_id)
+            if state in _RUN_GONE:
+                error = f"agent process exited before the run finished (run {state})"
         if self._abort_reason is not None:
             return self._abort_reason, text, usage, error or f"task {self._abort_reason.value.lower()}"
         if error:

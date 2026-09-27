@@ -64,7 +64,7 @@ class MessageRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=200_000, description="发给 agent 的消息")
     session_id: Optional[str] = Field(None, max_length=64, description="继续已有会话；为空时新建会话")
     max_duration_s: Optional[float] = Field(None, ge=60, le=86400, description="最长执行时间，超过即中止（TIMEOUT）")
-    agent: Optional[str] = Field(None, max_length=64, description="opencode 的 agent（如 build / plan），默认 build")
+    agent: Optional[str] = Field(None, max_length=64, description="opencode 引擎的 agent（如 build / plan），默认 build；pi 引擎不支持，传了返回 400")
     stream: bool = Field(True, description="true：SSE 流式返回；false：等任务结束后返回 JSON")
 
 

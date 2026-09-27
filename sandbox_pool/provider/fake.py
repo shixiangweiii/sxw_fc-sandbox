@@ -21,6 +21,7 @@ from sandbox_pool.provider.base import (
     SandboxNotFound,
 )
 from sandbox_pool.provider.fake_opencode import FakeOpencodeClient, FakeOpencodeServer
+from sandbox_pool.provider.fake_pi import FakePiClient, FakePiServer
 
 
 class FakeProvider:
@@ -44,6 +45,8 @@ class FakeProvider:
         self.fail_create_app = 0
         self.fail_update_network = 0
         self.network_updates: list[tuple[str, dict]] = []
+        # 这些模板建出的 app 沙箱里跑 pi 桥接进程，其余跑 opencode
+        self.pi_templates: set[str] = {"tpl-pi"}
 
     def _sweep(self) -> None:
         now = time.time()
@@ -53,8 +56,9 @@ class FakeProvider:
 
     def _drop(self, sandbox_id: str) -> bool:
         sb = self.sandboxes.pop(sandbox_id, None)
-        if sb is not None and sb.get("opencode") is not None:
-            sb["opencode"].shutdown()
+        for kind in ("opencode", "pi"):
+            if sb is not None and sb.get(kind) is not None:
+                sb[kind].shutdown()
         return sb is not None
 
     def _get(self, sandbox_id: str) -> dict:
@@ -204,7 +208,10 @@ class FakeProvider:
         sb = self.sandboxes[sid]
         sb["network"] = json.loads(json.dumps(network))
         sb["access_token"] = uuid.uuid4().hex
-        sb["opencode"] = FakeOpencodeServer(sb["files"])
+        if template in self.pi_templates:
+            sb["pi"] = FakePiServer(sb["files"])
+        else:
+            sb["opencode"] = FakeOpencodeServer(sb["files"])
         return AppSandbox(sid, f"https://{port}-{sid}.fake.local", sb["access_token"])
 
     async def update_network(self, sandbox_id: str, network: dict) -> None:
@@ -227,7 +234,13 @@ class FakeProvider:
     def app_client(self, endpoint, access_token, directory, *, ingress_ip):
         # endpoint 形如 https://4096-<sandbox_id>.fake.local
         sandbox_id = endpoint.split("://", 1)[1].split(".", 1)[0].split("-", 1)[1]
+        sb = self.sandboxes.get(sandbox_id) or {}
+        if sb.get("pi") is not None:
+            return FakePiClient(self, sandbox_id, access_token, directory)
         return FakeOpencodeClient(self, sandbox_id, access_token, directory)
 
     def opencode(self, sandbox_id: str) -> FakeOpencodeServer:
         return self.sandboxes[sandbox_id]["opencode"]
+
+    def pi(self, sandbox_id: str) -> FakePiServer:
+        return self.sandboxes[sandbox_id]["pi"]

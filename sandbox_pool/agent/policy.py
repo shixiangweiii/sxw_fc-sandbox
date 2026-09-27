@@ -273,7 +273,9 @@ def redact_platform_network(net: Any) -> Optional[dict]:
 
 # ---------- agent 设置与沙箱内文件 ----------
 
-SETTINGS_KEYS = ("idle_destroy_after_s", "mcp", "instructions")
+SETTINGS_KEYS = ("idle_destroy_after_s", "mcp", "instructions", "engine")
+# 引擎名的格式校验；是否已启用由 AgentService 判断（policy 不依赖配置）
+_ENGINE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 MAX_INSTRUCTIONS = 20_000
 
 
@@ -318,6 +320,11 @@ def validate_settings(patch: dict) -> dict:
         if not isinstance(v, str) or len(v) > MAX_INSTRUCTIONS:
             raise InvalidRequest(f"instructions must be a string of at most {MAX_INSTRUCTIONS} characters")
         out["instructions"] = v
+    if "engine" in patch:
+        v = patch["engine"]
+        if v is not None and (not isinstance(v, str) or not _ENGINE_NAME.match(v)):
+            raise InvalidRequest("engine must be an engine name (see GET /v1/agent-engines) or null for the default")
+        out["engine"] = v
     return out
 
 
@@ -347,7 +354,9 @@ def render_opencode_config(model: str, mcp: dict) -> dict:
 
 
 def render_agents_md(*, workdir: str, max_life_h: float, idle_destroy_after_s: float, mcp_names: list[str],
-                     egress: dict, instructions: str) -> str:
+                     egress: dict, instructions: str, mcp_hint: Optional[str] = None,
+                     extra_lines: Optional[list[str]] = None) -> str:
+    """工作目录的 AGENTS.md（opencode 与 pi 都会自动读取）；mcp_hint / extra_lines 是引擎特有的工具说明。"""
     idle = "不会因空闲销毁" if not idle_destroy_after_s else f"空闲 {idle_destroy_after_s / 3600:g} 小时后会被销毁"
     lines = [
         "# 运行环境说明（由沙箱池自动生成）",
@@ -360,7 +369,9 @@ def render_agents_md(*, workdir: str, max_life_h: float, idle_destroy_after_s: f
         "- 访问内网地址和云元数据地址会被拒绝。凭证由平台在出网时自动注入，环境变量里的 Key 只是占位符，不要打印或修改。",
     ]
     if mcp_names:
-        lines.append(f"- 可用的 MCP 服务：{', '.join(mcp_names)}。联网搜索优先使用 websearch 相关工具。")
+        hint = mcp_hint or "联网搜索优先使用 websearch 相关工具。"
+        lines.append(f"- 可用的 MCP 服务：{', '.join(mcp_names)}。{hint}")
+    lines.extend(extra_lines or [])
     lines.append("- pip / npm 已配置国内镜像。")
     if instructions.strip():
         lines += ["", "# 用户说明", "", instructions.strip()]

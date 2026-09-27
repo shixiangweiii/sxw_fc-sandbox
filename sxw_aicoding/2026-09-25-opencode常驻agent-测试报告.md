@@ -1,4 +1,4 @@
-# opencode 常驻 agent · 测试报告（2026-09-25 ~ 09-26）
+# 常驻 agent（opencode / pi）· 测试报告（2026-09-25 ~ 09-26）
 
 > 被测对象：sandbox_pool 的 agent 子系统（见 `sxw_aicoding/方案设计/2026-09-25-opencode应用沙箱池-实施方案.md`）。
 > 环境：
@@ -7,6 +7,7 @@
 > - 模型 `deepseek/deepseek-flash`，联网搜索用百炼 WebSearch MCP。
 >
 > 云上验证（PoC）报告：`sxw_aicoding/技术调研/2026-09-25-opencode云沙箱PoC验证报告.md`。
+> 2026-09-26 新增 pi 引擎与多引擎的测试，见第 6 节。
 
 ## 1. 结论
 
@@ -127,7 +128,81 @@
 - S9：空闲 60.1s 后销毁；
 - S10：kill -9 后 22.1s 被接管完成。
 
-## 6. 复现方式
+## 6. pi 引擎与多引擎（2026-09-26）
+
+方案见 `sxw_aicoding/方案设计/2026-09-26-pi引擎接入-实施方案.md`。pi 0.87.1、pi-mcp-adapter 2.37.0、桥接进程 0.1.2，模板 `vk1r2o1eln2byetc3lj6`（2C2G）。
+
+### 6.1 单元与组件测试
+
+| 项 | 结果 |
+| --- | --- |
+| 引擎抽象（opencode 搬到 `engines/` 后面） | 原有 147 个用例原样通过，opencode 行为零变化 |
+| `tests/test_agent_pi.py` | 23 个用例（评审修复后 26 个，见 6.6）：pi 事件翻译与结果提取（用本机真实 DeepSeek 实测的事件样本）、配置渲染与校验、pi 沙箱的对话 / 中止 / 超时 / 进程崩溃 / 桥接进程重启 / 接管 / 跨副本重连 / 设置下发 / 定时任务、引擎切换（空闲、有运行中任务、维护循环未跑时的旧会话、两个副本并发）、老记录兼容、接口、provider 写文件重试代理错误 |
+| 全量 | 170 个用例连跑 3 轮全部通过（评审修复后 173 个，见 6.6） |
+| 桥接进程（`node --test`，假的 pi） | 11 个用例：分帧（含 U+2028）、busy 409 与中止、进程崩溃后 run 为 lost、空闲回收后重开、重载推迟、UI 请求自动应答、进程上限、桥接进程重启后接续、启动预热、MCP 元数据缓存等待、pi 起不来。连跑 3 轮全部通过 |
+| 关键修复的反向验证 | 去掉「run 查询」「切换时转 RETIRING」「MCP 缓存等待」「写文件重试代理错误」任一处，对应用例都会失败 |
+
+### 6.2 本机真实联调（`scripts/pi_bridge_local_check.py`，真实 pi + DeepSeek）
+
+全部通过：
+- 建会话、流式对话、bash 工具正常；带工具的一轮 1.2s，约 $0.0012；
+- 续聊正常；
+- 中止后约 0.7s 回到空闲；
+- 运行中重载配置，任务照常完成（opencode 的重载会中断任务）。
+
+### 6.3 云上 PoC（`scripts/poc_pi_agent.py`，临时沙箱，共 3 轮）
+
+| 轮次 | 发现 | 处理 |
+| --- | --- | --- |
+| 1 | 镜像自带 Node v20.20.2；npmmirror 的 Node 二进制地址 302 到 CDN 后在沙箱里返回 503 | 改用 `cdn.npmmirror.com` 直链，`nodejs.org` 兜底 |
+| 2 | Node 与 npm 包都装好（`node_modules` 535MB，Node 205MB），但脚本把 `PATH` 限定成了不含 sbin 的列表，`runuser` 找不到 | 保留 sbin 路径 |
+| 3 | 全部通过：启动脚本 32.7s；不带令牌 403；DeepSeek 经注入（Node 信任平台 CA）首字 0.75s；bash；百炼 WebSearch MCP（工具名 `websearch_bailian_web_search`）；中止；运行中重载不中止；沙箱里只有占位符 Key；两个会话 + 桥接进程共约 250MB | — |
+
+构建模板时的发现：
+- 启动命令最长 16KiB（第一次构建报 `exceeds 16KiB`）。改为桥接脚本原文放进启动脚本、整体 gzip + base64，降到 12.5KB。
+- 快照后第一次起 pi 进程约 11s。桥接进程在监听前预热一次后降到 0.5～6.7s（两次验证测得，取决于平台缓存）。
+
+### 6.4 端到端（2 个副本，同时启用两种引擎，默认 opencode）
+
+| 轮次 | 模板 / 桥接进程 | 结果 | 说明 |
+| --- | --- | --- | --- |
+| pi 第 1 轮 | 初版（无预热） | S1–S12 全部通过 | S1 首条消息开始 13.9s（首个 pi 进程冷启动约 11s） |
+| pi 第 2 轮 | 加预热 | 全部通过 | S1 开始 8.4s |
+| pi 第 3 轮 | 0.1.1 | S2 联网搜索未通过 | 新沙箱没有 MCP 元数据缓存，第一次调用走了 `mcp` 代理工具（搜索本身成功）。桥接进程改为起会话进程时等缓存生成（最多 10s） |
+| pi 最终轮 | 0.1.2，`vk1r2o1eln2byetc3lj6` | **S1–S12 全部通过** | S2 直接工具；S1 开始 15.1s：第一次装配经本机 HTTP 代理写文件时代理返回 503，装配失败、沙箱重建。此后给写文件的重试加上代理错误（单测覆盖） |
+| opencode 回归 | `z0tkbiqlztqsma57014d` | S1、S2、S5、S7、S12、S11 全部通过 | S12 从 opencode 切到 pi 再切回 |
+
+pi 最终轮关键数据（`GET /v1/admin/agents/stats`，除 S1 外）：
+- 建沙箱 p50 0.54s，装配 p50 1.3s；
+- 热沙箱首字 1.0–1.4s；
+- bash / curl / 联网搜索一轮 2.4 / 3.6 / 5.6s；
+- 切白名单 1.1s 生效；跨副本重连 17.3s 拿到结果；
+- kill -9 后 20.1s 被接管完成；空闲 60.2s 后销毁；
+- S12 切换引擎后首条消息约 5s，旧会话 409。
+
+收尾：`cleanup_sandboxes.py` 确认账号下沙箱列表为空。中间版本的 pi 模板（`x532232mqrb9lermstjn`、`mf1byou8qoracdtsvzpg`、`ugrnjfmxkyi5oy4idtwc`，以及构建失败的 `0119ftjtknmohicg2lrg`）已删除，保留最终模板。
+
+### 6.5 已知限制
+
+- 新沙箱里第一个 pi 会话的冷启动为 0.5～7s（取决于平台缓存），新沙箱的首条消息比 opencode 慢；同一沙箱内之后新建会话约 0.7s。
+- MCP 设置变更后元数据缓存可能过期，适配器会先走代理工具再刷新（功能正常，多一两步）。
+- pi 仍是 0.x，升级要走「本机联调 → 新模板 → verify → 切换」流程。
+- 桥接进程 0.1.2 靠 pi 响应里的 `disposition` 识别「命令已处理、没有运行」，pi 0.87.1 不提供这个字段。网关已对以 `/` 开头的消息转义，唯一的触发来源已消除；桥接进程的改进留到下次重建模板（`代码评审/2026-09-26-pi引擎接入代码评审报告.md` 第五节）。
+
+### 6.6 代码评审修复后的回归（2026-09-26）
+
+评审报告见 `sxw_aicoding/代码评审/2026-09-26-pi引擎接入代码评审报告.md`：5 个问题（高 1、中 1、低 3），修复都在网关侧，桥接进程未改动、模板不用重建。
+
+| 项 | 结果 |
+| --- | --- |
+| 修复前基线 | pytest 170 个通过（113s）；桥接进程 11 个通过 |
+| 本机真实桥接进程 0.1.2 + 真实 pi 0.87.1（隔离 HOME、无效 Key） | 修复前 `/mcp tools`：会话 20s 后仍忙、run 为 `running`、再发消息 409、中止后仍忙；网关转义后发送的 ` /mcp tools`：运行正常结束、再发消息 200（PI-H1） |
+| 新增用例 | `test_pi_h1_…`（以 / 开头的消息作为普通提示词）、`test_pi_m1_…`（建会话、发提示词的超时长于桥接进程）、`test_pi_l1_…`（`sandbox_for` 按最新的引擎设置）；`fake_pi` 补上 0.87.1 下扩展命令不产生运行、会话一直忙的行为 |
+| 反向验证 | 去掉三处修复中的任一处，对应用例失败（H1 超时、M1 `ReadTimeout`、L1 建出 opencode 沙箱） |
+| 全量 | **173 个用例连跑 3 轮全部通过**（每轮约 116s） |
+| 桥接进程 | `node --test sandbox_pool/agent/pi_bridge/test/bridge.test.mjs`：11 个通过（文档里原来的目录写法在 Node 22+ 上会失败，已更正，PI-L2） |
+
+## 7. 复现方式
 
 ```bash
 # 1) 单元测试
@@ -144,6 +219,9 @@
 set -a; . ./.env; . .data/agent-e2e.env; set +a     # .env 另提供 E2B_*、POOL_AGENT_TEMPLATE、POOL_AGENT_INGRESS_IP
 scripts/run_local_cluster.sh start 8001 8002
 .venv/bin/python scripts/e2e_agent_scenarios.py --replicas 8001,8002
+# pi 引擎：.env 里再加 POOL_AGENT_PI_TEMPLATE=vk1r2o1eln2byetc3lj6，然后
+.venv/bin/python scripts/e2e_agent_scenarios.py --engine pi        # S1–S12；S12 切换引擎
+node --test sandbox_pool/agent/pi_bridge/test/bridge.test.mjs       # 桥接进程测试
 scripts/run_local_cluster.sh stop
 .venv/bin/python scripts/cleanup_sandboxes.py        # 确认账号下没有残留沙箱
 ```

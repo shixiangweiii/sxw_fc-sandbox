@@ -16,11 +16,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `examples/` 是早期摸底脚本：生命周期 demo、通过 OpenAPI 创建第二代模板。
 
-另有 **agent 子系统**（`sandbox_pool/agent/`，`POOL_AGENT_ENABLED=true` 开启）：每个（调用方，用户）一个运行在云沙箱里的常驻 opencode agent。它的文档在 `sxw_aicoding/`（用户要求过程文档放这里）：
-- `方案设计/…实施方案.md`：设计与执行结果；
-- `技术调研/…调研.md`、`技术调研/…PoC验证报告.md`：平台与 opencode 的实测结论；
+另有 **agent 子系统**（`sandbox_pool/agent/`，`POOL_AGENT_ENABLED=true` 开启）：每个（调用方，用户）一个运行在云沙箱里的常驻 agent，引擎按 agent 可选 opencode 或 pi。它的文档在 `sxw_aicoding/`（用户要求过程文档放这里）：
+- `方案设计/…实施方案.md`：设计与执行结果（opencode：`2026-09-25-opencode应用沙箱池-实施方案.md`；pi 与多引擎：`2026-09-26-pi引擎接入-实施方案.md`）；
+- `技术调研/…调研.md`、`技术调研/…PoC验证报告.md`：平台、opencode、pi 的实测结论；
 - `…业务接入使用手册.md`、`…测试报告.md`；
-- `代码评审/2026-09-26-opencode常驻agent子系统代码评审报告.md`：评审问题（AG-*）、取舍与修复记录。
+- `代码评审/2026-09-26-opencode常驻agent子系统代码评审报告.md`：评审问题（AG-*）、取舍与修复记录；
+- `代码评审/2026-09-26-pi引擎接入代码评审报告.md`：pi 引擎接入的评审（PI-*），含桥接进程的后续项（下次重建模板时处理）。
 
 ## 常用命令
 
@@ -55,13 +56,17 @@ agent 子系统的端到端测试（本机 macOS 用项目内 `.venv`，Python 3
 set -a; . ./.env; . .data/agent-e2e.env; set +a   # .env：云沙箱 / DeepSeek Key / POOL_AGENT_TEMPLATE / POOL_AGENT_INGRESS_IP；
                                                   # agent-e2e.env：鉴权 key、MCP 与注入配置（生成方式见测试报告），均不入库
 scripts/run_local_cluster.sh start 8001 8002
-python scripts/e2e_agent_scenarios.py [--only S1,S4]   # S1–S11；S10 会 kill -9 8001
+python scripts/e2e_agent_scenarios.py [--only S1,S4] [--engine pi]   # S1–S12；S10 会 kill -9 8001；S12 切换引擎
 scripts/run_local_cluster.sh stop && python scripts/cleanup_sandboxes.py
 python scripts/build_opencode_template.py [verify <模板ID>]   # 构建 / 验证 opencode 模板（需要 AK/SK 与 FCSANDBOX_TEAM_ID）
 python scripts/poc_opencode_agent.py                   # 云上逐项验证平台能力（建临时沙箱，结束销毁）
+python scripts/build_pi_template.py [verify <模板ID>]   # 构建 / 验证 pi 模板
+python scripts/poc_pi_agent.py                         # pi：临时沙箱里跑模板启动脚本并逐项验证，结束销毁
+node --test sandbox_pool/agent/pi_bridge/test/bridge.test.mjs   # pi 桥接进程测试（假的 pi，不联网；Node 22+ 不接受目录参数）
+DEEPSEEK_API_KEY=... python scripts/pi_bridge_local_check.py --pi <pi 的 dist/bundle/cli.js>   # 本机真实 pi 联调
 ```
 
-- opencode 模板 `z0tkbiqlztqsma57014d`（cn-hangzhou，2C4G，opencode 1.18.32）同样保留不删。
+- opencode 模板 `z0tkbiqlztqsma57014d`（cn-hangzhou，2C4G，opencode 1.18.32）、pi 模板 `vk1r2o1eln2byetc3lj6`（2C2G，pi 0.87.1 + pi-mcp-adapter 2.37.0）同样保留不删。
 - 本机开着代理的 fake-ip / TUN 模式：到沙箱子域名的新连接约 1/3 失败。网关访问 opencode 要设 `POOL_AGENT_INGRESS_IP`；envd 调用只能靠重试。
 
 ## 架构要点（需要跨文件理解的部分）
@@ -105,24 +110,32 @@ python scripts/poc_opencode_agent.py                   # 云上逐项验证平�
 **agent 子系统**（`agent/service.py` 组装，`maintainer.py` 后台维护，`runner.py` 执行任务，`store/agent_repo.py` 存储）：
 - **池与状态**：
   - agent 沙箱与代码执行池共用 `sandboxes` 表，但用独立池名（`agent_pool_name`），不暂停；
-  - 状态流转为 CREATING → WARMING（装配：等健康、写 `opencode.json` / `AGENTS.md` / `egress.json`）→ ACTIVE → RETIRING → DESTROYING；
+  - 状态流转为 CREATING → WARMING（装配：等健康、写引擎的配置文件与 `egress.json`）→ ACTIVE → RETIRING → DESTROYING；
   - 每个 agent 最多一个在建或在服务的沙箱（在池级锁内判断）。
+- **引擎**（`agent/engines/`）：
+  - opencode（`opencode serve`）与 pi（`agent/pi_bridge/pi-bridge.mjs` 桥接进程，每个会话一个 `pi --mode rpc` 子进程）。两者的控制接口路径相同，网关用同一个 HTTP 客户端；事件翻译、结果提取、配置文件渲染按引擎区分。
+  - agent 的引擎存在 `agents.settings.engine`（空为 `POOL_AGENT_DEFAULT_ENGINE`）；沙箱记录存 `sandboxes.engine`（老记录为空，视为 opencode）。接管、重连、健康检查都按沙箱记录找引擎。
+  - 切换引擎复用轮换：`sandbox_for` 与维护循环把引擎不一致的 ACTIVE 沙箱转为 RETIRING（空闲直接销毁）；带 `session_id` 续聊到旧引擎的沙箱返回 409。
+  - pi 的 `prompt_async` 返回 `run_id`（存 `tasks.run_id`）：跟进结束后查 run 状态，`lost` / `unknown`（进程或桥接进程重启过）记为 FAILED，不把残缺结果当成功。
+  - 用户消息经 `engine.prompt_text()` 发送：pi 会把以 `/` 开头、命中扩展命令（`/mcp` 等）的文本当命令执行、不产生运行，0.87.1 的响应又不带 `disposition`，桥接进程会把会话永久记为忙。`PiEngine` 在前面加空格转义，不要去掉（PI-H1）。
+  - 建会话、发提示词是非幂等 POST，超时不重试：读超时用 `_SLOW_POST_TIMEOUT_S`（150s），必须长于桥接进程处理它们的上限（冷启动、MCP 缓存等待、pi 的 preflight 压缩，约 141s），否则会留下无人跟进的运行（PI-M1）。
+  - 桥接进程随模板发布，改它要重建模板，所以只做转发和进程管理；pi 的中止表现为 `stopReason=error`，中止状态以网关自己的标记为准。平台约束（Node 版本、CA、下载源、启动命令 16KiB 上限）见 `fc-agent-sandbox-notes.md`。
 - **任务执行**：
   - 任务由后台 `TaskRunner` 执行，HTTP 响应只读订阅队列；客户端断开不取消 runner，也不在数据库操作中途取消；
   - runner 刷新 `tasks.op_deadline` 作为心跳，过期后其他副本 CAS 接管（`resume=True`）。
 - **任务准入**（`AgentStore.create_task`，池级锁内）：同一事务里检查沙箱仍在服务、会话不忙、未超并发上限、沙箱不在重载配置，插入任务并记录沙箱活动时间、把版本号加一。版本号加一使维护循环按旧快照做的空闲销毁或轮换 CAS 失败，不会销毁刚接了新任务的沙箱；`touch_sandbox` 在任务结束时做同样的事。
-- **重载配置**（设置变更后的 `POST /instance/dispose`）会中止沙箱里所有运行中的会话，必须与任务准入互斥：`begin_reload` 在池级锁内确认没有运行中任务，再占住 ACTIVE 行的 `op_owner` / `op_deadline`（在服务的沙箱只有这时这两列非空），期间 `create_task` 返回 reloading、请求路径等待；重载整体限时且短于占用时长。
+- **重载配置**（设置变更后的 `POST /instance/dispose`）：opencode 会中止沙箱里所有运行中的会话（pi 桥接进程只重启空闲会话进程），必须与任务准入互斥：`begin_reload` 在池级锁内确认没有运行中任务，再占住 ACTIVE 行的 `op_owner` / `op_deadline`（在服务的沙箱只有这时这两列非空），期间 `create_task` 返回 reloading、请求路径等待；重载整体限时且短于占用时长。
 - **出网**：
   - 凭证只经 `network.rules` 注入：模型 Key 与 `POOL_AGENT_INJECT` 只允许管理员配置，调用方无法新增注入域名；
   - 沙箱内只有占位符 `injected-by-platform`；
   - 平台上 `allow_out` 优先于 `deny_out`：放行项不能与强制屏蔽的内网 / 元数据网段重叠，开放模式不接受域名放行项（`parse_policy`）。库里的旧覆盖用 `strict=False` 读取，违规项丢弃而不是报错；
   - 平台实测约束见 `agent/policy.py` 顶部。
-- **访问沙箱内 opencode**：
+- **访问沙箱内 agent 服务**：
   - 用 `agent/opencode.py`，`trust_env=False`、可选入口 IP 直连（SNI / Host 用沙箱域名）；
   - 建连失败一律重试，非幂等 POST 读失败不重试；
   - 维护循环只用 HTTP 探测 `/global/health`，不调用 `connect()`。
 - **接口输出**：`access_token`（流量令牌）与 `lease_id` 一样是凭证，任何接口都不返回（`sandbox_view`、管理员列表都要去掉）。
-- **测试**：`provider/fake_opencode.py` 是内存版 opencode，提示词里的 `[sleep:秒]`、`[tool]`、`[error]`、`[ask]`、`[remember]` 等指令模拟不同行为；它与真实行为一致的两点不要去掉：客户端 close 后再调用报错、dispose 取消运行中的会话。`make_agents` 夹具可建多个副本（各自打开 store，模拟多进程）；生产中 `create_app` 让 agent 子系统共用代码执行池的数据库引擎（每进程一个 SQLite 写连接）。`tests/test_agent_review_fixes.py` 按评审编号（AG-*）组织。
+- **测试**：`provider/fake_opencode.py` 是内存版 opencode，提示词里的 `[sleep:秒]`、`[tool]`、`[error]`、`[ask]`、`[remember]` 等指令模拟不同行为；它与真实行为一致的两点不要去掉：客户端 close 后再调用报错、dispose 取消运行中的会话。`make_agents` 夹具可建多个副本（各自打开 store，模拟多进程）；生产中 `create_app` 让 agent 子系统共用代码执行池的数据库引擎（每进程一个 SQLite 写连接）。`tests/test_agent_review_fixes.py` 按评审编号（AG-*）组织。`provider/fake_pi.py` 是内存版 pi 桥接进程（另有 `[crash]` 指令），保留的真实语义：重载不中止运行中的会话、进程丢失后 run 为 lost、`restart()` 后旧 run 为 unknown、`/mcp` 等扩展命令不产生运行且会话一直忙（pi 0.87.1）；`FakeProvider.pi_templates` 里的模板建出 pi 沙箱。`tests/test_agent_pi.py` 末尾按评审编号（PI-*）组织。
 
 **鉴权**（`api/auth.py`）：
 - `POOL_API_KEYS` / `POOL_ADMIN_KEYS`，格式「名称:key」，逗号分隔。两者都为空时关闭鉴权，此时进程拒绝监听非回环地址（除非 `--allow-no-auth`）。
@@ -137,7 +150,7 @@ python scripts/poc_opencode_agent.py                   # 云上逐项验证平�
   - 多次调用得到多个副本，它们共享同一个 SQLite 文件和同一个 `FakeProvider`（模拟共享的云端）。
   - `run_maintainer=False` 时可以手动调用 `maintainer.replenish(...)` 和 `lifecycle.wait_background()`，精确控制时序。
 - `FakeProvider` 可以模拟平台超时回收，并支持失败和延迟注入：`fail_create` / `fail_set_timeout` / `fail_kill` / `fail_resume_ids`、`latency_s` / `kill_latency_s` / `set_timeout_delays`。
-- `tests/test_agent_*.py`：agent 子系统。`units` 覆盖纯逻辑（策略、cron、SSE、事件翻译），`service` 覆盖服务与维护循环，`api` 覆盖 HTTP 接口。
+- `tests/test_agent_*.py`：agent 子系统。`units` 覆盖纯逻辑（策略、cron、SSE、事件翻译），`service` 覆盖服务与维护循环，`api` 覆盖 HTTP 接口，`pi` 覆盖 pi 引擎与引擎切换。
 - `tests/test_review_fixes.py` 按第一轮评审问题编号（H1、M1…L10）组织，`tests/test_review_r2_fixes.py` 按第二轮编号（R2-*）组织。
   - 修并发问题时要构造出确定性的时序，并确认去掉修复后用例会失败。
   - 修完后全量连跑多轮，排查偶发失败。

@@ -1,18 +1,19 @@
-# opencode 常驻 agent · 业务接入使用手册
+# 常驻 agent（opencode / pi）· 业务接入使用手册
 
-> 适用版本：sandbox_pool（agent 子系统）+ opencode 1.18.32 + 阿里云云沙箱（cn-hangzhou）。更新日期：2026-09-26（按代码评审修复更新了出网策略校验、设置重载、定时任务接口的说明，见 `sxw_aicoding/代码评审/2026-09-26-opencode常驻agent子系统代码评审报告.md`）。
+> 适用版本：sandbox_pool（agent 子系统）+ opencode 1.18.32 / pi 0.87.1 + 阿里云云沙箱（cn-hangzhou）。
+> 2026-09-26 新增 pi 引擎：接入方可以按用户选择 agent loop 引擎，见第 10 节；设计见 `sxw_aicoding/方案设计/2026-09-26-pi引擎接入-实施方案.md`。更新日期：2026-09-26（按代码评审修复更新了出网策略校验、设置重载、定时任务接口的说明，见 `sxw_aicoding/代码评审/2026-09-26-opencode常驻agent子系统代码评审报告.md`）。
 > 设计与实现见 `sxw_aicoding/方案设计/2026-09-25-opencode应用沙箱池-实施方案.md`；测试结果见 `sxw_aicoding/2026-09-25-opencode常驻agent-测试报告.md`。
 
 ## 1. 这是什么
 
-沙箱池服务为**每个用户提供一个常驻的 opencode agent**。agent 运行在阿里云云沙箱里：
+沙箱池服务为**每个用户提供一个常驻的 agent**，引擎可选 [opencode](https://opencode.ai)（默认）或 [pi](https://pi.dev)，由接入方按用户选择（第 10 节）。agent 运行在阿里云云沙箱里：
 - 能读写文件、执行命令、抓取网页、联网搜索（百炼 WebSearch MCP）；
 - 使用 DeepSeek 模型（默认 `deepseek/deepseek-flash`）。
 
 业务系统只需要用 HTTP 调用，不接触云沙箱 SDK，也不持有模型 Key。
 
 ```
-业务系统 ──HTTP（Bearer API Key）──► 沙箱池服务（可多副本）──► 云沙箱：opencode serve（每个用户一个）
+业务系统 ──HTTP（Bearer API Key）──► 沙箱池服务（可多副本）──► 云沙箱：opencode serve 或 pi 桥接进程（每个用户一个）
                                          │ 状态存库：agent、任务、定时任务、出网策略
                                          │ 后台：轮换、空闲销毁、健康检查、定时任务、任务接管
                                          └ 模型 / 搜索的 Key 由平台在出网时注入，沙箱里只有占位符
@@ -39,9 +40,14 @@
 3. **结果以最终回复为准**：任务结束时，最终回复、token 用量、状态、错误会写入任务记录，沙箱销毁后仍可查询。agent 生成的文件会随沙箱销毁，需要保留的内容请让 agent 写进最终回复。
 4. **无人值守**：agent 的权限询问、反问会被自动拒绝，不会挂起等人。
 5. **同一会话同一时间只能跑一个任务**：会话正忙时再发消息返回 409。每个 agent 同时运行的任务数有上限（默认 3），超过返回 429。
-6. **首次对话会新建沙箱**：
+6. **引擎按用户选择，切换引擎等于换沙箱**：
+   - 用 `PATCH /v1/agents/{user_id}/settings {"engine": "pi"}` 选择；不设置时用服务的默认引擎。
+   - 切换后，运行中的任务在旧沙箱上跑完；新消息在新引擎的沙箱上执行；旧会话的 `session_id` 返回 409。
+   - 对外接口、SSE 事件、任务与定时任务的语义两种引擎相同，能力差异见第 10 节。
+7. **首次对话会新建沙箱**：
    - 正常网络下，新建加装配约 2–5 秒；本机开着代理的 fake-ip 时约 10–15 秒，见第 9 节。
    - 沙箱就绪后，首字约 1–2 秒。
+   - pi 引擎：新沙箱里第一个会话要起 pi 进程，冷启动约 0.5–7 秒（取决于平台缓存），首条消息最慢约 8–9 秒；之后新会话约 0.7 秒。
 
 ## 3. 快速开始
 
@@ -64,6 +70,17 @@ python scripts/build_opencode_template.py verify <模板ID>   # 可选：建一�
 - 模板内置 git / python3 / pip / node / npm / curl，以及固定版本的 opencode 和守护进程；pip / npm 默认使用国内镜像。
 - 当前 cn-hangzhou 已构建的模板：`z0tkbiqlztqsma57014d`。
 
+**pi 模板**（使用 pi 引擎时需要，只需构建一次）：
+
+```bash
+python scripts/build_pi_template.py                  # 约 2.5 分钟，输出 POOL_AGENT_PI_TEMPLATE=<模板ID>
+python scripts/build_pi_template.py verify <模板ID>   # 可选：确认桥接进程已在运行、首个会话耗时，然后销毁
+```
+
+- 基于同一个官方镜像，规格 2C2G（pi 桥接进程约 60MB，每个活动会话进程约 110MB）。
+- 内置 Node 24、固定版本的 pi 和 pi-mcp-adapter、桥接进程（`sandbox_pool/agent/pi_bridge/pi-bridge.mjs`）与守护进程。
+- 当前 cn-hangzhou 已构建的 pi 模板：`vk1r2o1eln2byetc3lj6`。
+
 ### 3.3 配置并启动服务
 
 ```bash
@@ -73,8 +90,10 @@ export E2B_API_KEY=... E2B_API_URL=https://api.cn-hangzhou.e2b.fc.aliyuncs.com E
 export POOL_API_KEYS="mybiz:<随机长串>" POOL_ADMIN_KEYS="ops:<另一个随机长串>"
 # agent 子系统
 export POOL_AGENT_ENABLED=true
-export POOL_AGENT_TEMPLATE=z0tkbiqlztqsma57014d
+export POOL_AGENT_TEMPLATE=z0tkbiqlztqsma57014d              # opencode 引擎（配了模板即启用）
 export POOL_AGENT_MODEL=deepseek/deepseek-flash
+export POOL_AGENT_PI_TEMPLATE=vk1r2o1eln2byetc3lj6           # 可选：启用 pi 引擎
+export POOL_AGENT_DEFAULT_ENGINE=opencode                    # 没有选择引擎的用户用哪个
 export POOL_AGENT_MODEL_API_KEY=<DeepSeek Key>          # 只注入到出网请求，不进沙箱
 # 百炼联网搜索 MCP（Key 同样由平台注入）
 export BAILIAN_MCP_API_KEY=<百炼 WebSearch Key>
@@ -89,7 +108,7 @@ python -m sandbox_pool --host 0.0.0.0 --port 8001          # 单副本
 # 或本地多副本（共享 SQLite）：PYTHON=.venv/bin/python scripts/run_local_cluster.sh start 8001 8002
 ```
 
-启动时会校验配置，配置有误会直接退出并说明原因。常见原因：未设置模板、`POOL_AGENT_INJECT` 引用了未设置的环境变量、时间参数不合理。
+启动时会校验配置，配置有误会直接退出并说明原因。常见原因：两个引擎的模板都没设置、默认引擎没有启用、`POOL_AGENT_INJECT` 引用了未设置的环境变量、时间参数不合理。
 
 ### 3.4 发第一条消息
 
@@ -134,7 +153,7 @@ data: {"task_id": "b136…", "state": "SUCCEEDED", "result": "系统架构是 x8
 | `text` | string，必填 | 发给 agent 的消息 |
 | `session_id` | string | 继续已有会话；不传则新建会话 |
 | `max_duration_s` | number，60–86400 | 最长执行时间。超过后中止，状态为 `TIMEOUT`。默认同时受 `POOL_AGENT_TASK_MAX_DURATION_S`（4h）限制 |
-| `agent` | string | opencode 的 agent（`build` 默认，`plan` 只读规划） |
+| `agent` | string | opencode 引擎的 agent（`build` 默认，`plan` 只读规划）；pi 引擎不支持，传了返回 400 |
 | `stream` | bool，默认 true | true：SSE 流式；false：等任务结束后返回任务 JSON（见 4.3） |
 
 **SSE 事件**（`text/event-stream`；没有事件时每 15 秒发送一次 `: keepalive` 注释）：
@@ -145,7 +164,7 @@ data: {"task_id": "b136…", "state": "SUCCEEDED", "result": "系统架构是 x8
 | `text` | `{delta}` | 回复文本增量，按顺序拼接即完整回复 |
 | `reasoning` | `{delta}` | 模型思考过程增量（可忽略） |
 | `tool` | `{tool, status, title, input, output, error}` | 工具调用状态变化：`running` / `completed` / `error`；输入输出截断到 2000 字符 |
-| `status` | `{type: "retry", message, attempt}` | 模型限流等原因正在重试 |
+| `status` | `{type, message, …}` | `retry`：模型限流等原因正在重试（带 `attempt`）；pi 引擎另有 `compaction`（正在压缩上下文）、`ui_request`（扩展请求交互，已自动应答） |
 | `done` | `{task_id, state, result, usage, error, session_id}` | 任务结束，流随之关闭 |
 
 `state` 的取值：
@@ -160,8 +179,9 @@ data: {"task_id": "b136…", "state": "SUCCEEDED", "result": "系统架构是 x8
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/v1/agents/{user_id}` | 设置、当前沙箱（状态、创建时间、硬截止 `hard_deadline`）、运行中的任务 ID |
-| PATCH | `/v1/agents/{user_id}/settings` | 修改设置（只传要改的字段），沙箱空闲时自动应用：重写配置并重载 opencode（通常 1–2 秒）。重载会中断运行中的会话，所以只在没有任务时进行；重载期间到达的新消息会等它完成再开始 |
+| GET | `/v1/agents/{user_id}` | 设置、当前生效的引擎 `engine`、当前沙箱（引擎、状态、创建时间、硬截止 `hard_deadline`）、运行中的任务 ID |
+| GET | `/v1/agent-engines` | 已启用的引擎、默认引擎、各自的模型与能力差异（见第 10 节） |
+| PATCH | `/v1/agents/{user_id}/settings` | 修改设置（只传要改的字段），沙箱空闲时自动应用：重写配置并重载 agent（通常 1–2 秒）。opencode 的重载会中断运行中的会话，所以只在没有任务时进行；重载期间到达的新消息会等它完成再开始。改 `engine` 则是换沙箱（第 2 节第 6 条） |
 | DELETE | `/v1/agents/{user_id}/sandbox` | 重置：销毁当前沙箱（运行中任务记为失败），下次对话自动新建 |
 
 设置字段：
@@ -170,7 +190,8 @@ data: {"task_id": "b136…", "state": "SUCCEEDED", "result": "系统架构是 x8
 | --- | --- |
 | `idle_destroy_after_s` | 空闲多少秒后销毁沙箱以节省费用；0 表示不因空闲销毁，默认取 `POOL_AGENT_IDLE_DESTROY_AFTER_S`。由定时任务唤醒的沙箱，结束后按更短的 `POOL_AGENT_SCHEDULE_IDLE_TAIL_S`（默认 600s）收尾 |
 | `instructions` | 给 agent 的长期说明，写入工作目录的 `AGENTS.md`，最长 20000 字 |
-| `mcp` | 追加的 MCP 服务，格式同 opencode 的 `mcp` 配置：`{"名称": {"type": "remote", "url": "https://…"}}` 或 `{"名称": {"type": "local", "command": ["npx", "-y", "…"]}}`。不要在这里写密钥：沙箱里的 agent 能读到这里的内容，密钥请让管理员通过 `POOL_AGENT_INJECT` 注入 |
+| `engine` | agent 使用的引擎：`opencode` / `pi`（必须是已启用的引擎），传 `null` 恢复默认 |
+| `mcp` | 追加的 MCP 服务，格式同 opencode 的 `mcp` 配置（pi 引擎会自动转换成 pi-mcp-adapter 的格式）：`{"名称": {"type": "remote", "url": "https://…"}}` 或 `{"名称": {"type": "local", "command": ["npx", "-y", "…"]}}`。不要在这里写密钥：沙箱里的 agent 能读到这里的内容，密钥请让管理员通过 `POOL_AGENT_INJECT` 注入 |
 
 ### 4.3 任务
 
@@ -352,9 +373,14 @@ agent 子系统的配置都以 `POOL_AGENT_` 开头；其余配置沿用沙箱�
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `POOL_AGENT_ENABLED` | false | 开启 agent 子系统 |
-| `POOL_AGENT_TEMPLATE` | — | opencode 模板 ID（必填） |
+| `POOL_AGENT_TEMPLATE` | — | opencode 模板 ID；配了即启用 opencode 引擎（与 pi 模板至少配一个） |
+| `POOL_AGENT_PI_TEMPLATE` | — | pi 模板 ID；配了即启用 pi 引擎 |
+| `POOL_AGENT_DEFAULT_ENGINE` | `opencode` | 没有选择引擎的 agent 用哪个（必须已启用）。修改后，没有选择过引擎的用户在下一次请求时换沙箱 |
+| `POOL_AGENT_PI_MODEL` | `deepseek/deepseek-flash` | pi 引擎的模型（provider/model）；模型 Key 的注入配置与 opencode 共用 |
+| `POOL_AGENT_PI_THINKING` | 空 | pi 引擎的思考级别：`off` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`，空为 pi 默认 |
+| `POOL_AGENT_PI_PORT` | 4096 | pi 桥接进程端口（与模板一致） |
 | `POOL_AGENT_POOL_NAME` | agents | 池名：库记录和云端元数据 `pool`，用于对账 |
-| `POOL_AGENT_MODEL` | `deepseek/deepseek-flash` | 模型（provider/model） |
+| `POOL_AGENT_MODEL` | `deepseek/deepseek-flash` | opencode 引擎的模型（provider/model） |
 | `POOL_AGENT_MODEL_HOST` | `api.deepseek.com` | 模型 Key 注入的域名 |
 | `POOL_AGENT_MODEL_API_KEY` | — | 模型 Key：只注入到出网请求，不进沙箱 |
 | `POOL_AGENT_INJECT` | 空 | 额外的凭证注入 JSON：`{域名: {请求头: 值}}`，值支持 `${环境变量}`。每个沙箱最多 10 个域名，只能由管理员配置 |
@@ -390,7 +416,7 @@ agent 子系统的配置都以 `POOL_AGENT_` 开头；其余配置沿用沙箱�
 - **多用户隔离**：
   - 每个用户一个独立的沙箱（虚拟机级隔离）；
   - agent 按「调用方 key + user_id」隔离；
-  - opencode 内部没有多用户隔离，不要让多个终端用户共用同一个 `user_id`。
+  - opencode / pi 内部都没有多用户隔离，不要让多个终端用户共用同一个 `user_id`。
 - **不要把密钥写进 `instructions` 或 `mcp` 设置**：agent 能读到这些内容。
 
 ## 8. 运维
@@ -413,6 +439,10 @@ agent 子系统的配置都以 `POOL_AGENT_` 开头；其余配置沿用沙箱�
   2. 先用 `verify` 子命令验证；
   3. 修改 `POOL_AGENT_TEMPLATE` 并滚动重启。
   已有沙箱会在轮换或空闲销毁后换成新模板；需要立即生效时，逐个重置用户即可。不要覆盖正在使用的模板。
+- **升级 pi**：pi 仍是 0.x，版本间常有破坏性变更。
+  1. 先用新版本跑本机联调 `scripts/pi_bridge_local_check.py`（本机真实 pi + 模型，不建云沙箱）；
+  2. 用 `--pi-version`（必要时 `--mcp-version`）构建新模板并 `verify`；
+  3. 修改 `POOL_AGENT_PI_TEMPLATE` 滚动重启。沙箱替换方式同上。
 - **成本估算**（Eco 邀测价，2C4G 为 0.24 元/小时，不含模型费用）：
   - 一直运行：约 173 元/月/用户；
   - 空闲 1 小时即销毁、每天用约 4 小时：约 36 元/月/用户；
@@ -431,3 +461,40 @@ agent 子系统的配置都以 `POOL_AGENT_` 开头；其余配置沿用沙箱�
 | 联网搜索不可用 | 检查 `POOL_AGENT_MCP`、`POOL_AGENT_INJECT` 与 `BAILIAN_MCP_API_KEY`。打开沙箱内 `/home/user/.agent/egress.json`，确认 `injected_hosts` 里有 `dashscope.aliyuncs.com`；白名单模式下注入域名会自动放行 |
 | agent 访问某网站失败 | 查看 `GET /v1/agents/{user_id}/egress`，确认 `in_sync` 以及是否处于白名单模式 |
 | 定时任务没有执行 | 检查 `enabled` 和 `next_run_at`。上一次还在运行且 `overlap=skip` 时会跳过；服务停机期间错过的触发不补跑 |
+| pi 引擎的任务 `FAILED`，错误为「agent process exited …」 | 沙箱里的 pi 进程或桥接进程在运行中退出（内存不足、被杀）。任务不会被当成成功；会话文件还在，可以继续用同一个 `session_id` 重试。频繁出现时看沙箱内 `/home/user/.agent/pi-logs/`、`pi-bridge.log` |
+| 切换引擎后续聊返回 409「belongs to engine …」 | 旧会话属于切换前的引擎，请开新会话 |
+| `PATCH …/settings` 返回 400「engine … is not enabled」 | 该引擎没有配置模板。先用 `GET /v1/agent-engines` 查看可选的引擎 |
+
+## 10. 选择引擎：opencode 与 pi
+
+两种引擎共用同一套接口、任务、定时任务、出网策略和凭证注入，区别只在沙箱里运行的 agent loop：
+
+| | opencode（默认） | pi |
+| --- | --- | --- |
+| 沙箱里运行 | `opencode serve`（HTTP 服务） | pi 桥接进程 + 每个会话一个 `pi --mode rpc` 进程 |
+| 模板规格 | 2C4G（opencode 常驻约 850MB） | 2C2G（桥接进程约 60MB，每个活动会话约 110MB，空闲 10 分钟回收） |
+| 新沙箱的首条消息 | 约 2–5 秒 | 约 3–9 秒（第一个 pi 进程冷启动 0.5–7 秒，取决于平台缓存）；之后新会话约 0.7 秒 |
+| 内置工具 | 读写文件、bash、webfetch 等 | 读写文件、bash；没有网页抓取工具，agent 用 curl |
+| 联网搜索（百炼 MCP） | 内置 MCP，工具名 `websearch_bailian_web_search` | 经 pi-mcp-adapter 直接注册，工具名相同 |
+| `agent` 参数（build / plan） | 支持 | 不支持，传了返回 400 |
+| 以 `/` 开头的消息（如 `/mcp tools`） | 作为普通文本发给模型 | 同左：网关转义后发送，不会执行 pi 的扩展命令 |
+| 权限询问 | 有，自动拒绝 | 没有权限系统；扩展的交互请求自动应答（`status` 事件 `ui_request`） |
+| 改设置后的重载 | 会中断运行中的会话（服务只在空闲时重载） | 只重启空闲会话的进程，不中断运行中的会话 |
+| `usage` | 各字段齐全 | 各字段齐全；工具事件没有 `title` |
+| 上下文过长 | 自动压缩 | 自动压缩（`status` 事件 `compaction`） |
+
+```bash
+# 可选的引擎
+curl -H "Authorization: Bearer $KEY" http://127.0.0.1:8001/v1/agent-engines
+# 把用户 u1 切到 pi（之后的新消息在 pi 沙箱上执行）
+curl -X PATCH -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+     -d '{"engine": "pi"}' http://127.0.0.1:8001/v1/agents/u1/settings
+# 恢复默认引擎
+curl -X PATCH -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+     -d '{"engine": null}' http://127.0.0.1:8001/v1/agents/u1/settings
+```
+
+选择建议：
+- 需要 `plan` 这类只读规划模式、内置网页抓取，或者对首条消息延迟敏感：用 opencode。
+- 想要更低的内存和成本、改设置不打断运行中的任务，或者需要 pi 的扩展生态：用 pi。
+- 同一个用户可以随时切换；切换只影响之后的会话。

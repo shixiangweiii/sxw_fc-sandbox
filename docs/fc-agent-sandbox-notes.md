@@ -34,6 +34,16 @@
   - **DNS**：DNS 服务器是 `100.100.2.136`，在 `100.64.0.0/10` 内。屏蔽元数据只能写 `100.100.100.200/32`，不能整段屏蔽。
   - **本机代理的影响**：本机开着代理的 fake-ip / TUN 模式时，到沙箱域名的连接约 1/3 失败，直连入口 IP 则稳定；httpx 默认读系统代理，对沙箱域名返回 503。
   - **envd 异常类型**：刚创建的沙箱，前几次 envd 调用可能抛 `httpcore.ConnectError`（经 e2b_connect，不是 httpx 异常）。
+- **pi 引擎（2026-09-26 实测，见 `sxw_aicoding/方案设计/2026-09-26-pi引擎接入-实施方案.md` 第 10、11 节与测试报告第 6 节）**：
+  - 镜像自带 Node 是 **v20.20.2**，低于 pi 要求的 22.19，模板里另装 Node 24。envd 环境带 `NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/e2b-ca.crt`，Node 因此信任平台 CA，出网注入对 Node 生效（pi 用占位符 Key 调 DeepSeek、pi-mcp-adapter 调百炼 MCP 均成功）。模板的守护脚本里显式设置这个变量，不依赖继承。
+  - **下载 Node**：`registry.npmmirror.com/-/binary/node/...` 会 302 跳到 CDN，在沙箱里经这一跳返回 503（本机正常）；直接用 `cdn.npmmirror.com/binaries/node/...`（32MB 约 0.9s）或 `nodejs.org/dist`（约 3s）。`mirrors.aliyun.com/nodejs-release` 同样 503。
+  - **启动命令最长 16KiB**：`CreateTemplate` 构建时报 `startCommand is invalid: exceeds 16KiB`。脚本要整体压缩，只编码一层。
+  - **启动脚本里不要把 `PATH` 限定到不含 sbin 的列表**：最后切换用户用的 `runuser` 在 `/usr/sbin`。
+  - **快照后第一次起新进程很慢**：模板快照前没运行过 pi 时，沙箱里第一次起 pi 进程约 11s，之后约 0.7s。桥接进程在监听前先预热一次（进入快照）后降到 0.5～6.7s（两次验证分别测得，取决于平台侧缓存）。
+  - **pi 0.87.1 的 RPC `prompt`（本机实测，2026-09-26 代码评审）**：
+    - 响应只有 `{"success": true}`，不带新版文档里的 `disposition`；
+    - 以 `/` 开头、命中扩展命令（pi-mcp-adapter 注册的 `/mcp`、`/pi-mcp`、`/mcp-auth`）的文本会被当命令执行，不产生运行、没有 `agent_settled`，桥接进程 0.1.2 因此把会话永久记为忙。网关在这类文本前加空格转义；
+    - 响应要等 preflight 完成，其中包括上一轮被中止时的上下文压缩（调一次模型），可能远超 30s。见 `sxw_aicoding/代码评审/2026-09-26-pi引擎接入代码评审报告.md`。
 - **第二代 code-interpreter 镜像环境**：
   - 默认用户 user（sudo 组），x86_64，Debian 13，PID 1 为 systemd；
   - 自带 git / python3 / pip3 / node / npm / curl / tar，没有 unzip。

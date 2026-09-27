@@ -115,7 +115,8 @@ class AgentStore(Store):
             return [dict(r) for r in (await conn.execute(q.order_by(sandboxes.c.created_at))).mappings().all()]
 
     async def reserve_agent_sandbox(
-        self, *, agent_id: str, template: str, now: float, owner: str, op_deadline: float, limit: int
+        self, *, agent_id: str, template: str, now: float, owner: str, op_deadline: float, limit: int,
+        engine: Optional[str] = None,
     ) -> tuple[str, Optional[dict]]:
         """给 agent 占一个沙箱名额（插入 CREATING 记录）。
 
@@ -161,6 +162,7 @@ class AgentStore(Store):
                 agent_id=agent_id,
                 health_failures=0,
                 activity_kind="message",
+                engine=engine,
             )
             await conn.execute(insert(sandboxes).values(**row))
             return "created", row

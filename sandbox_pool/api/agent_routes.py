@@ -92,6 +92,12 @@ async def post_message(user_id: str, body: MessageRequest, request: Request, cal
     )
 
 
+@router.get("/agent-engines")
+async def list_engines(request: Request, caller: Caller = Depends(require_caller)):
+    """已启用的 agent 引擎、默认引擎、各自的模型与能力差异；agent 的引擎用 PATCH /agents/{user_id}/settings 的 engine 选择。"""
+    return _svc(request).engines_info()
+
+
 @router.get("/agents/{user_id}")
 async def get_agent(user_id: str, request: Request, caller: Caller = Depends(require_caller)):
     svc = _svc(request)

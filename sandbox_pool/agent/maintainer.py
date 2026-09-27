@@ -3,11 +3,12 @@
 每轮：
 - 过渡态接管：CREATING / WARMING / DESTROYING 超过 op_deadline（执行者大概率已崩溃）→ 销毁；
 - 任务接管：心跳过期的 RUNNING 任务 → CAS 成为负责副本，跟进到结束；
-- 在服务的沙箱（ACTIVE / RETIRING）：硬截止、轮换、空闲销毁、健康检查、平台超时续期、出网策略与设置下发；
+- 在服务的沙箱（ACTIVE / RETIRING）：硬截止、轮换、切换引擎、空闲销毁、健康检查、平台超时续期、出网策略与设置下发；
 - 定时任务：到期的用 CAS 推进 next_run_at 后触发（多副本下每次只触发一次）；
 - 全池周期任务：对账、历史清理（pool_kv 时间戳 CAS，每个周期一个副本）。
 
-agent 沙箱不暂停（按 Eco 规则）。健康检查用 HTTP 访问 /global/health，不调用 connect()。
+agent 沙箱不暂停（按 Eco 规则）。健康检查用 HTTP 访问 /global/health（opencode serve 与 pi 桥接进程都提供），
+不调用 connect()。
 """
 
 import asyncio
@@ -156,6 +157,16 @@ class AgentMaintainer:
             if not running:
                 await self.svc.lc.destroy(row, "retired", background=True)
                 return
+        elif self.svc.engine_for(row).name != self.svc.agent_engine(agent).name:
+            # agent 切换了引擎：与轮换相同，空闲就销毁，有任务就转 RETIRING 跑完再销毁；下一次请求在新引擎上建沙箱
+            if not running:
+                await self.svc.lc.destroy(row, "engine switched", background=True)
+            elif await self.store.cas_sandbox(
+                row["id"], [SandboxState.ACTIVE], now=now, expect_version=row["version"], state=SandboxState.RETIRING
+            ):
+                await self.svc.lc.event("agent_engine_switch", sandbox_row_id=row["id"],
+                                        detail=f"{self.svc.engine_for(row).name} -> {self.svc.agent_engine(agent).name}")
+            return
         elif now >= row["created_at"] + self.cfg.agent_rotate_after_s:
             if not running:
                 await self.svc.lc.destroy(row, "rotated", background=True)

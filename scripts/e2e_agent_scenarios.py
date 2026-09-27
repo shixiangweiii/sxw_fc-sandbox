@@ -1,7 +1,9 @@
 """agent 子系统端到端场景（真实云沙箱 + 本地多副本集群）。结果写入 .data/e2e-agent-report.json（不含密钥）。
 
     # 先按 sxw_aicoding/…业务接入使用手册.md 配置环境变量并启动集群（POOL_AGENT_ENABLED=true）
-    python scripts/e2e_agent_scenarios.py [--only S1,S2,...] [--replicas 8001,8002]
+    python scripts/e2e_agent_scenarios.py [--only S1,S2,...] [--replicas 8001,8002] [--engine opencode|pi]
+
+--engine：先把测试用户的引擎设为指定值（不传则用服务端默认引擎）；报告写入 .data/e2e-agent-report-<引擎>.json。
 
 环境变量：SANDBOX_POOL_API_KEY（调用方 key）、SANDBOX_POOL_ADMIN_KEY（管理员 key，可选）、
 POOL_AGENT_INGRESS_IP（可选，用于 S3 直连沙箱端口验证 403）。
@@ -12,7 +14,7 @@ POOL_AGENT_INGRESS_IP（可选，用于 S3 直连沙箱端口验证 403）。
   S3 安全：沙箱内无 Key、元数据 / 内网不可达、端口 403  S9 空闲销毁后自动新建
   S4 出网策略：API 读取、agent 读文件、运行中切白名单  S10 kill -9 持有任务的副本，任务被接管完成
   S5 会话连续                                          S11 收尾：重置 agent，确认没有残留沙箱
-  S6 断线重连（到另一个副本）
+  S6 断线重连（到另一个副本）                         S12 切换引擎（当前 → 另一个 → 切回），需要两个引擎都已启用
 """
 
 import argparse
@@ -30,6 +32,8 @@ import httpx
 ROOT = Path(__file__).resolve().parents[1]
 USER = f"e2e-{int(time.time())}"
 REPORT: dict = {"user": USER, "started_at": time.strftime("%Y-%m-%d %H:%M:%S"), "scenarios": {}}
+# 当前测试用户的引擎（main 里按 --engine 或服务端默认设置）
+ENGINE = {"name": None}
 
 
 def log(msg: str) -> None:
@@ -121,9 +125,15 @@ async def s1(api: Api, ctx: dict) -> None:
 async def s2(api: Api, ctx: dict) -> None:
     res = await api.stream_message("用 bash 工具执行 `python3 -c 'print(6*7)'`，然后只回复输出结果。")
     check("S2", "42" in tool_output(res, "bash"), tool="bash", total_s=res.get("total_s"), answer=res["text"][:80])
-    res = await api.stream_message("用 webfetch 工具抓取 https://www.example.com ，告诉我页面标题。")
-    check("S2", any(t["tool"] == "webfetch" and t["status"] == "completed" for t in res["tools"])
-          and "Example Domain" in res["text"], tool="webfetch", total_s=res.get("total_s"), answer=res["text"][:80])
+    if ENGINE["name"] == "pi":
+        # pi 没有 webfetch 工具，按 AGENTS.md 的说明用 bash + curl 抓网页
+        res = await api.stream_message("抓取 https://www.example.com 的网页内容，告诉我页面标题。")
+        check("S2", "Example Domain" in tool_output(res, "bash") and "Example Domain" in res["text"], tool="bash+curl",
+              total_s=res.get("total_s"), answer=res["text"][:80])
+    else:
+        res = await api.stream_message("用 webfetch 工具抓取 https://www.example.com ，告诉我页面标题。")
+        check("S2", any(t["tool"] == "webfetch" and t["status"] == "completed" for t in res["tools"])
+              and "Example Domain" in res["text"], tool="webfetch", total_s=res.get("total_s"), answer=res["text"][:80])
     res = await api.stream_message("使用 websearch 联网搜索工具搜索“阿里云 函数计算 云沙箱”，用一句话总结搜索结果。")
     names = [t["tool"] for t in res["tools"] if t["status"] == "completed"]
     check("S2", any("websearch" in (n or "") for n in names), tool="websearch MCP", tools=names,
@@ -146,9 +156,12 @@ async def s3(api: Api, ctx: dict) -> None:
                 await asyncio.sleep(1 + attempt)
         return last
 
-    # 取回 opencode 进程环境、envd 环境与配置文件，在本地检查真实 Key 是否出现（Key 不发进沙箱、不打印）
-    dump = await run("P=$(pgrep -f 'opencode serve' | head -1); tr '\\0' '\\n' < /proc/$P/environ; env; "
-                     "cat /home/user/workspace/opencode.json /home/user/.agent/egress.json /home/user/workspace/AGENTS.md")
+    # 取回 agent 进程（opencode serve / pi 桥接进程及其会话进程）环境、envd 环境与配置文件，在本地检查真实 Key 是否
+    # 出现（Key 不发进沙箱、不打印）
+    dump = await run("for P in $(pgrep -f 'opencode serve|pi-bridge.mjs|pi-coding-agent/dist'); do "
+                     "tr '\\0' '\\n' < /proc/$P/environ; done; env; "
+                     "cat /home/user/workspace/opencode.json /home/user/.agent/pi.json /home/user/.pi/agent/mcp.json "
+                     "/home/user/.agent/egress.json /home/user/workspace/AGENTS.md 2>/dev/null")
     secrets = [v for v in (os.environ.get("POOL_AGENT_MODEL_API_KEY"), os.environ.get("BAILIAN_MCP_API_KEY")) if v]
     leaked = any(v in dump or v[-12:] in dump for v in secrets)
     check("S3", bool(secrets) and not leaked and "DEEPSEEK_API_KEY=injected-by-platform" in dump,
@@ -317,6 +330,33 @@ async def s11(api: Api, admin: Optional[Api]) -> None:
               token_hidden="access_token" not in json.dumps(agents))
 
 
+async def s12(api: Api, ctx: dict) -> None:
+    """切换引擎：当前引擎上建会话 → 切到另一个引擎（换沙箱，旧会话 409）→ 切回。"""
+    engines = [e["name"] for e in (await api.req("GET", "/v1/agent-engines")).json()["engines"]]
+    if len(engines) < 2:
+        check("S12", False, skipped="need both engines enabled", engines=engines)
+        return
+    first = (await api.req("GET", f"/v1/agents/{USER}")).json()["engine"]
+    other = next(e for e in engines if e != first)
+    res = await api.stream_message("请记住：绿色火车。只回复“记住了”，不要调用工具。")
+    sid = res.get("start", {}).get("session_id")
+    t0 = time.monotonic()
+    r = await api.req("PATCH", f"/v1/agents/{USER}/settings", json={"engine": other})
+    res = await api.stream_message("用一句话回答：2+3 等于几？不要调用工具。")
+    info = (await api.req("GET", f"/v1/agents/{USER}")).json()
+    active = [s["engine"] for s in info["sandboxes"] if s["state"] == "ACTIVE"]
+    check("S12", r.status_code == 200 and info["engine"] == other and res.get("done", {}).get("state") == "SUCCEEDED"
+          and active == [other], switched_to=other, first_message_on_new_engine_s=round(time.monotonic() - t0, 1),
+          sandboxes=[(s["engine"], s["state"]) for s in info["sandboxes"]], answer=res["text"][:60])
+    r = await api.req("POST", f"/v1/agents/{USER}/messages", json={"text": "暗号是什么？", "session_id": sid, "stream": False})
+    check("S12", r.status_code == 409, old_session_after_switch=r.status_code)
+    await api.req("PATCH", f"/v1/agents/{USER}/settings", json={"engine": first})
+    res = await api.stream_message("用一句话回答：3+4 等于几？不要调用工具。")
+    info = (await api.req("GET", f"/v1/agents/{USER}")).json()
+    check("S12", res.get("done", {}).get("state") == "SUCCEEDED" and info["engine"] == first
+          and [s["engine"] for s in info["sandboxes"] if s["state"] == "ACTIVE"] == [first], switched_back_to=first)
+
+
 def read_pids() -> dict:
     path = ROOT / ".data" / "cluster.pids"
     out = {}
@@ -332,6 +372,7 @@ async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", help="逗号分隔的场景编号，如 S1,S2")
     ap.add_argument("--replicas", default="8001,8002")
+    ap.add_argument("--engine", help="测试用户使用的引擎（opencode / pi），不传用服务端默认")
     args = ap.parse_args()
     only = set((args.only or "").upper().split(",")) - {""}
     ports = [int(p) for p in args.replicas.split(",")]
@@ -341,10 +382,21 @@ async def main() -> int:
     admin = Api(f"http://127.0.0.1:{ports[-1]}", admin_key) if admin_key else None
     a, b = apis[0], apis[-1]
     ctx: dict = {}
+    if args.engine:
+        r = await a.req("PATCH", f"/v1/agents/{USER}/settings", json={"engine": args.engine})
+        if r.status_code != 200:
+            log(f"cannot select engine {args.engine}: {r.status_code} {r.text}")
+            return 1
+    ENGINE["name"] = (await a.req("GET", f"/v1/agents/{USER}")).json()["engine"] if args.engine else None
+    if ENGINE["name"] is None:
+        ENGINE["name"] = (await a.req("GET", "/v1/agent-engines")).json()["default"]
+    REPORT["engine"] = ENGINE["name"]
+    log(f"engine: {ENGINE['name']}")
     steps = [
         ("S1", lambda: s1(a, ctx)), ("S2", lambda: s2(a, ctx)), ("S3", lambda: s3(a, ctx)), ("S4", lambda: s4(b, ctx)),
         ("S5", lambda: s5(b, ctx)), ("S6", lambda: s6(a, ctx, b)), ("S7", lambda: s7(b, ctx)), ("S8", lambda: s8(a, ctx)),
-        ("S9", lambda: s9(b, ctx)), ("S10", lambda: s10(a, ctx, b, read_pids())), ("S11", lambda: s11(b, admin)),
+        ("S9", lambda: s9(b, ctx)), ("S10", lambda: s10(a, ctx, b, read_pids())), ("S12", lambda: s12(b, ctx)),
+        ("S11", lambda: s11(b, admin)),
     ]
     try:
         for name, fn in steps:
@@ -364,7 +416,7 @@ async def main() -> int:
                 REPORT["agent_stats"] = (await admin.req("GET", "/v1/admin/agents/stats")).json()
             except Exception:  # noqa: BLE001
                 pass
-        out = ROOT / ".data" / "e2e-agent-report.json"
+        out = ROOT / ".data" / (f"e2e-agent-report-{ENGINE['name']}.json" if args.engine else "e2e-agent-report.json")
         out.write_text(json.dumps(REPORT, ensure_ascii=False, indent=2), encoding="utf-8")
         log(f"report: {out}")
         for api in apis + ([admin] if admin else []):

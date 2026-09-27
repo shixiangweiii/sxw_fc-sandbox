@@ -185,10 +185,10 @@ python scripts/cleanup_sandboxes.py     # 兜底：销毁账号下全部沙箱�
 - 下载文件（`GET files`）仍整体读入内存，大文件可改为流式转发。
 - 已实测暂停中的沙箱不受 `timeout` 回收（超过 `end_at` 后仍可恢复，内存还在），所以 PAUSED 不需要续期、也不跟踪 `platform_deadline`。平台侧单个沙箱的最长存活时间还未实测，`max_age_s` 先取 6 小时。
 
-## 10. agent 子系统（常驻 opencode agent）
+## 10. agent 子系统（常驻 agent，引擎可选 opencode / pi）
 
-同一进程可选开启 agent 子系统（`POOL_AGENT_ENABLED=true`）：每个（调用方，用户）一个运行在云沙箱里的 opencode agent，与代码执行池共用 provider 和数据库，使用独立的池名（默认 `agents`）。
-- 设计与执行结果：`sxw_aicoding/方案设计/2026-09-25-opencode应用沙箱池-实施方案.md`；
+同一进程可选开启 agent 子系统（`POOL_AGENT_ENABLED=true`）：每个（调用方，用户）一个运行在云沙箱里的常驻 agent，与代码执行池共用 provider 和数据库，使用独立的池名（默认 `agents`）。引擎按 agent 选择：opencode（`opencode serve`）或 pi（沙箱内桥接进程 + 每会话一个 `pi --mode rpc`），每个引擎一个模板，切换引擎等于换沙箱。
+- 设计与执行结果：`sxw_aicoding/方案设计/2026-09-25-opencode应用沙箱池-实施方案.md`；pi 与多引擎：`sxw_aicoding/方案设计/2026-09-26-pi引擎接入-实施方案.md`；
 - 接入：`sxw_aicoding/2026-09-25-opencode常驻agent-业务接入使用手册.md`；
 - 测试：`sxw_aicoding/2026-09-25-opencode常驻agent-测试报告.md`。
 

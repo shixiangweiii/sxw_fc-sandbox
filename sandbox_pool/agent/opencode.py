@@ -1,4 +1,5 @@
-"""网关访问沙箱内 opencode server 的 HTTP 客户端。
+"""网关访问沙箱内 agent 服务的 HTTP 客户端：opencode serve，或 pi 桥接进程（控制接口沿用 opencode 的路径，
+见 agent/pi_bridge/pi-bridge.mjs）。
 
 - 经平台入口 https://<port>-<sandbox_id>.<domain> 访问，每个请求带流量令牌 e2b-traffic-access-token。
 - 所有请求带 ?directory=<工作目录>：opencode 按目录加载项目配置（opencode.json、AGENTS.md）。
@@ -8,7 +9,8 @@
   配置了 ingress_ip 就不走 HTTPS_PROXY：经代理隧道时 httpcore 用目标地址（IP）做 TLS 的 server_hostname、
   忽略 sni_hostname，证书校验必然失败（实测 CERTIFICATE_VERIFY_FAILED: IP address mismatch）。
 - 建连失败（ConnectError / ConnectTimeout）说明请求没发出去，任何方法都重试；幂等的 GET 读失败也重试；
-  非幂等的 POST 读失败不重试（请求可能已生效）。
+  非幂等的 POST 读失败不重试（请求可能已生效）。所以建会话、发提示词的超时要长于沙箱内服务处理它们的上限
+  （_SLOW_POST_TIMEOUT_S，pi 桥接进程可能要冷启动进程、先压缩上下文）。
 """
 
 import asyncio
@@ -25,10 +27,15 @@ _CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout)
 # 幂等请求额外重试的错误：读响应时连接断开
 _IDEMPOTENT_ERRORS = _CONNECT_ERRORS + (httpx.ReadError, httpx.RemoteProtocolError, httpx.WriteError)
 _RETRY_DELAYS = (0.3, 0.8, 1.5, 3.0, 5.0)
+# 建会话、发提示词的超时（PI-M1）：pi 做完 preflight（可能先压缩上下文，要调一次模型）才响应 prompt；桥接进程还可能要
+# 等旧进程退出（≤11s）、冷启动会话进程（get_state ≤60s）、等 MCP 元数据缓存（≤10s），RPC 自身再限 60s，合计约 141s
+# （pi-bridge.mjs 的 CONF）。网关要比桥接进程等得久：请求非幂等不能重试，先超时就会把任务记为失败，而运行照常开始。
+# opencode 的这两个请求立即返回，不受影响。
+_SLOW_POST_TIMEOUT_S = 150.0
 
 
 class OpencodeError(Exception):
-    """opencode server 返回错误或不可达。"""
+    """沙箱内 agent 服务返回错误或不可达。"""
 
     def __init__(self, message: str, status: Optional[int] = None):
         super().__init__(message)
@@ -36,13 +43,17 @@ class OpencodeError(Exception):
 
 
 class OpencodeAPI(Protocol):
-    """AgentService / TaskRunner 依赖的 opencode 能力；测试用内存实现（provider/fake.py 的 FakeOpencode）。"""
+    """AgentService / TaskRunner 依赖的沙箱内 agent 能力；测试用内存实现（provider/fake_opencode.py、fake_pi.py）。"""
 
     async def health(self) -> dict: ...
 
     async def create_session(self, title: str) -> str: ...
 
-    async def prompt_async(self, session_id: str, text: str, *, model: Optional[str], agent: Optional[str]) -> None: ...
+    async def prompt_async(self, session_id: str, text: str, *, model: Optional[str], agent: Optional[str]) -> Optional[str]:
+        """受理后返回 run_id（pi 桥接进程）；opencode 返回 None。"""
+
+    async def run_state(self, session_id: str, run_id: str) -> str:
+        """running / settled / lost / unknown（仅 pi 桥接进程支持）。"""
 
     async def abort(self, session_id: str) -> bool: ...
 
@@ -93,7 +104,7 @@ def make_proxy() -> Optional[str]:
     return os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
 
 
-class OpencodeHttpClient:
+class AgentHttpClient:
     def __init__(
         self,
         endpoint: str,
@@ -113,6 +124,7 @@ class OpencodeHttpClient:
             headers["e2b-traffic-access-token"] = access_token
         self._params = {"directory": directory}
         self._sse_timeout = httpx.Timeout(timeout_s, read=sse_read_timeout_s)
+        self._slow_timeout = httpx.Timeout(max(timeout_s, _SLOW_POST_TIMEOUT_S), connect=min(10.0, timeout_s))
         self.proxy = None if ingress_ip else make_proxy()
         self._http = httpx.AsyncClient(
             base_url=base,
@@ -122,12 +134,17 @@ class OpencodeHttpClient:
             proxy=self.proxy,
         )
 
-    async def _request(self, method: str, path: str, *, json_body: Any = None, idempotent: bool) -> httpx.Response:
+    async def _request(
+        self, method: str, path: str, *, json_body: Any = None, idempotent: bool, slow: bool = False
+    ) -> httpx.Response:
         retry_on = _IDEMPOTENT_ERRORS if idempotent else _CONNECT_ERRORS
+        timeout = self._slow_timeout if slow else httpx.USE_CLIENT_DEFAULT
         last: Optional[Exception] = None
         for delay in (*_RETRY_DELAYS, None):
             try:
-                resp = await self._http.request(method, path, params=self._params, json=json_body, extensions=self._ext)
+                resp = await self._http.request(
+                    method, path, params=self._params, json=json_body, extensions=self._ext, timeout=timeout
+                )
             except retry_on as e:
                 last = e
                 if delay is None:
@@ -150,17 +167,27 @@ class OpencodeHttpClient:
         return self._json(await self._request("GET", "/global/health", idempotent=True)) or {}
 
     async def create_session(self, title: str) -> str:
-        session = self._json(await self._request("POST", "/session", json_body={"title": title}, idempotent=False))
+        session = self._json(
+            await self._request("POST", "/session", json_body={"title": title}, idempotent=False, slow=True)
+        )
         return session["id"]
 
-    async def prompt_async(self, session_id: str, text: str, *, model: Optional[str], agent: Optional[str]) -> None:
+    async def prompt_async(self, session_id: str, text: str, *, model: Optional[str], agent: Optional[str]) -> Optional[str]:
         body: dict = {"parts": [{"type": "text", "text": text}]}
         if model:
             provider_id, _, model_id = model.partition("/")
             body["model"] = {"providerID": provider_id, "modelID": model_id}
         if agent:
             body["agent"] = agent
-        await self._request("POST", f"/session/{session_id}/prompt_async", json_body=body, idempotent=False)
+        resp = await self._request(
+            "POST", f"/session/{session_id}/prompt_async", json_body=body, idempotent=False, slow=True
+        )
+        data = self._json(resp)
+        return data.get("run_id") if isinstance(data, dict) else None
+
+    async def run_state(self, session_id: str, run_id: str) -> str:
+        data = self._json(await self._request("GET", f"/session/{session_id}/run/{run_id}", idempotent=True)) or {}
+        return data.get("state") or "unknown"
 
     async def abort(self, session_id: str) -> bool:
         # 中止是幂等的：重复中止同一个会话没有副作用
@@ -213,3 +240,7 @@ class OpencodeHttpClient:
 
     async def close(self) -> None:
         await self._http.aclose()
+
+
+# 旧名字
+OpencodeHttpClient = AgentHttpClient

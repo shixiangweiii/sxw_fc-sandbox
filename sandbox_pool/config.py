@@ -69,17 +69,25 @@ class PoolConfig:
     # 其余请求体（JSON）的大小上限，在鉴权之前生效
     max_body_bytes: int = 1024 * 1024
 
-    # ---------- agent 子系统（每个用户一个常驻 opencode agent，见 sandbox_pool/agent/）----------
+    # ---------- agent 子系统（每个用户一个常驻 agent，引擎可选 opencode / pi，见 sandbox_pool/agent/）----------
     agent_enabled: bool = False
     # 独立的池名：agent 沙箱的库记录与云端元数据 pool 都用它，与代码执行池互不影响
     agent_pool_name: str = "agents"
-    # opencode 模板（第二代运行时，见 scripts/build_opencode_template.py）
+    # opencode 引擎的模板（第二代运行时，见 scripts/build_opencode_template.py），配了即启用
     agent_template: str = ""
     agent_port: int = 4096
     agent_workdir: str = "/home/user/workspace"
+    # pi 引擎的模板（见 scripts/build_pi_template.py），配了即启用；模型为 provider/model，思考级别为空时用 pi 的默认
+    agent_pi_template: str = ""
+    agent_pi_port: int = 4096
+    agent_pi_model: str = "deepseek/deepseek-flash"
+    agent_pi_thinking: str = ""
+    # 没有设置引擎的 agent 用哪个（必须已启用）
+    agent_default_engine: str = "opencode"
     # 平台入口 IP（可选）：本机 DNS 被代理的 fake-ip 接管时，直连该 IP 访问沙箱端口（SNI / Host 仍用沙箱域名）。
     # 取值：dig +short @223.5.5.5 api.<region>.e2b.fc.aliyuncs.com
     agent_ingress_ip: str = ""
+    # opencode 引擎的模型
     agent_model: str = "deepseek/deepseek-flash"
     # 平台在出网时给该域名注入模型 Key（Authorization: Bearer），Key 不进沙箱
     agent_model_host: str = "api.deepseek.com"

@@ -69,6 +69,9 @@ _NOT_SENT_ERRORS = (httpx.ConnectError, httpx.WriteError, httpcore.ConnectError,
 _STALE_RETRY_DELAYS = (0.3, 1.0)
 # 幂等的文件写入（agent 装配）用更长的重试
 _WRITE_RETRY_DELAYS = (0.5, 1.0, 2.0, 3.0)
+# 文件写入额外重试代理隧道没建起来的错误（请求没发出去）：本机 HTTP 代理对刚创建沙箱的 envd 域名偶发返回 503
+# （pi 引擎端到端测试中出现，装配因此失败、整个沙箱重建）
+_WRITE_RETRY_ERRORS = _STALE_CONNECTION_ERRORS + (httpx.ProxyError, httpcore.ProxyError)
 
 
 def check_deadlines(cfg: "PoolConfig") -> None:
@@ -400,13 +403,13 @@ class E2BProvider:
                 try:
                     await h.files.write(path, data, request_timeout=_API_TIMEOUT)
                     break
-                except _STALE_CONNECTION_ERRORS as e:
+                except _WRITE_RETRY_ERRORS as e:
                     if delay is None:
                         raise
                     log.info("write %s to %s failed (%r), retrying in %.1fs", path, sandbox_id, e, delay)
                     await asyncio.sleep(delay)
 
     def app_client(self, endpoint, access_token, directory, *, ingress_ip):
-        from sandbox_pool.agent.opencode import OpencodeHttpClient
+        from sandbox_pool.agent.opencode import AgentHttpClient
 
-        return OpencodeHttpClient(endpoint, access_token, directory, ingress_ip=ingress_ip)
+        return AgentHttpClient(endpoint, access_token, directory, ingress_ip=ingress_ip)

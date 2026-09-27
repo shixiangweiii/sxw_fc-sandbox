@@ -110,4 +110,4 @@ class SandboxProvider(Protocol):
         """写入多个文件（幂等，连接类错误会重试）；需要重新连接时按 sandbox_timeout_s 设置平台超时。"""
 
     def app_client(self, endpoint: str, access_token: Optional[str], directory: str, *, ingress_ip: Optional[str]):
-        """访问沙箱内 opencode server 的客户端（sandbox_pool.agent.opencode.OpencodeAPI）。"""
+        """访问沙箱内 agent 服务（opencode serve 或 pi 桥接进程）的客户端（sandbox_pool.agent.opencode.OpencodeAPI）。"""

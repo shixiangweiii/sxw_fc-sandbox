@@ -43,6 +43,8 @@ sandboxes = Table(
     Column("health_failures", Integer),
     # 最后一次活动的来源（message / schedule），决定空闲销毁用哪个时长
     Column("activity_kind", String(16)),
+    # 沙箱里跑的引擎（opencode / pi）；老记录为空，视为 opencode
+    Column("engine", String(16)),
     Index("ix_sandboxes_pool_state", "pool", "state"),
 )
 
@@ -91,6 +93,8 @@ tasks = Table(
     Column("op_owner", String(128)),
     Column("op_deadline", Float),
     Column("abort_requested", Integer, nullable=False, default=0),
+    # 引擎返回的运行 ID（pi）：接管后据此确认这次运行是否还在
+    Column("run_id", String(64)),
     Index("ix_tasks_pool_agent_created", "pool", "agent_id", "created_at"),
     Index("ix_tasks_pool_state", "pool", "state"),
 )

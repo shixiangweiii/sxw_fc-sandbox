@@ -1,4 +1,4 @@
-"""agent 子系统的组装入口与请求路径：每个（调用方，用户）一个常驻 opencode agent。
+"""agent 子系统的组装入口与请求路径：每个（调用方，用户）一个常驻 agent，引擎可选 opencode / pi（agent/engines/）。
 
 一个进程（副本）一个 AgentService，与代码执行池（SandboxPool）共用 provider 和数据库，使用独立的池名。
 多副本协调沿用仓库约定：状态存库、CAS、池级锁行，不选主。后台维护见 maintainer.py，任务执行见 runner.py。
@@ -12,6 +12,7 @@ import uuid
 from typing import AsyncIterator, Optional
 
 from sandbox_pool.agent import cron
+from sandbox_pool.agent.engines import LEGACY_ENGINE, THINKING_LEVELS, Engine, FilesContext, build_engines
 from sandbox_pool.agent.maintainer import AgentMaintainer
 from sandbox_pool.agent.policy import (
     EGRESS_FILE,
@@ -23,12 +24,10 @@ from sandbox_pool.agent.policy import (
     network_version,
     parse_policy,
     redact_platform_network,
-    render_agents_md,
-    render_opencode_config,
     validate_settings,
     build_network,
 )
-from sandbox_pool.agent.runner import TaskRunner, Translator, extract_result
+from sandbox_pool.agent.runner import TaskRunner
 from sandbox_pool.config import PoolConfig
 from sandbox_pool.core.lifecycle import Lifecycle
 from sandbox_pool.core.pool import _percentile, new_replica_id
@@ -65,10 +64,20 @@ def check_agent_config(cfg: PoolConfig) -> None:
     if not cfg.agent_enabled:
         return
     errors = []
-    if not cfg.agent_template:
-        errors.append("POOL_AGENT_TEMPLATE is required (see scripts/build_opencode_template.py)")
+    if not cfg.agent_template and not cfg.agent_pi_template:
+        errors.append(
+            "POOL_AGENT_TEMPLATE (opencode) or POOL_AGENT_PI_TEMPLATE (pi) is required "
+            "(see scripts/build_opencode_template.py, scripts/build_pi_template.py)"
+        )
+    enabled = [n for n, e in build_engines(cfg).items() if e.enabled]
+    if enabled and cfg.agent_default_engine not in enabled:
+        errors.append(f"POOL_AGENT_DEFAULT_ENGINE must be one of the enabled engines {enabled}")
     if "/" not in cfg.agent_model:
         errors.append("POOL_AGENT_MODEL must look like provider/model")
+    if "/" not in cfg.agent_pi_model:
+        errors.append("POOL_AGENT_PI_MODEL must look like provider/model")
+    if cfg.agent_pi_thinking and cfg.agent_pi_thinking not in THINKING_LEVELS:
+        errors.append(f"POOL_AGENT_PI_THINKING must be one of {THINKING_LEVELS} or empty")
     if not (0 < cfg.agent_rotate_after_s < cfg.agent_max_life_s <= 86400):
         errors.append("require 0 < POOL_AGENT_ROTATE_AFTER_S < POOL_AGENT_MAX_LIFE_S <= 86400 (platform max lifetime)")
     if cfg.agent_boot_timeout_s < 60:
@@ -94,6 +103,7 @@ def sandbox_view(row: Optional[dict], cfg: PoolConfig) -> Optional[dict]:
     if row is None:
         return None
     out = {k: v for k, v in row.items() if k not in _HIDDEN_SANDBOX_FIELDS}
+    out["engine"] = row.get("engine") or LEGACY_ENGINE
     out["hard_deadline"] = row["created_at"] + cfg.agent_max_life_s
     return out
 
@@ -116,6 +126,8 @@ class AgentService:
         self.store = store or AgentStore.open(cfg.db_url, cfg.agent_pool_name)
         self.provider = provider
         self.lc = Lifecycle(cfg, self.store, provider, self.replica_id)
+        # 全部引擎（含未启用的，老沙箱记录可能属于它们）；可供 agent 选择的是 enabled 的
+        self.engines: dict[str, Engine] = build_engines(cfg)
         self.default_egress: EgressPolicy = default_policy(cfg.agent_egress)
         self.default_mcp: dict = default_mcp(cfg.agent_mcp)
         self.injections = load_injections(cfg.agent_model_host, cfg.agent_model_api_key, cfg.agent_inject)
@@ -136,7 +148,8 @@ class AgentService:
         await self.store.init_schema()
         if run_maintainer:
             await self.maintainer.start()
-        log.info("agent service replica %s started (template=%s)", self.replica_id, self.cfg.agent_template)
+        log.info("agent service replica %s started (engines=%s, default=%s)", self.replica_id,
+                 {n: e.template for n, e in self.engines.items() if e.enabled}, self.cfg.agent_default_engine)
 
     async def stop(self, grace_s: float = 30) -> None:
         """先让本副本的 runner 让出任务（其他副本接管，不中止 opencode 里的任务），再停维护循环。
@@ -168,6 +181,30 @@ class AgentService:
 
     # ---------- 基础 ----------
 
+    def enabled_engines(self) -> dict[str, Engine]:
+        return {n: e for n, e in self.engines.items() if e.enabled}
+
+    def engine_for(self, row: dict) -> Engine:
+        """沙箱记录上的引擎（老记录为空，视为 opencode）。"""
+        return self.engines[row.get("engine") or LEGACY_ENGINE]
+
+    def agent_engine(self, agent: dict) -> Engine:
+        """agent 设置的引擎；没设置、或设置的引擎已停用时用默认引擎。"""
+        name = (agent.get("settings") or {}).get("engine")
+        engine = self.engines.get(name) if name else None
+        if engine is None or not engine.enabled:
+            engine = self.engines[self.cfg.agent_default_engine]
+        return engine
+
+    def engines_info(self) -> dict:
+        return {
+            "default": self.cfg.agent_default_engine,
+            "engines": [
+                {**e.describe(), "default": n == self.cfg.agent_default_engine}
+                for n, e in self.enabled_engines().items()
+            ],
+        }
+
     def client_for(self, row: dict):
         client = self._clients.get(row["id"])
         if client is None:
@@ -198,6 +235,7 @@ class AgentService:
             "idle_destroy_after_s": float(s.get("idle_destroy_after_s", self.cfg.agent_idle_destroy_after_s)),
             "mcp": s.get("mcp") or {},
             "instructions": s.get("instructions") or "",
+            "engine": s.get("engine"),
         }
 
     def hard_deadline(self, row: dict) -> float:
@@ -238,13 +276,23 @@ class AgentService:
             "created_at": agent["created_at"],
             "settings": self.agent_settings(agent),
             "settings_version": agent["settings_version"],
+            # 当前生效的引擎（设置为空时是默认引擎）
+            "engine": self.agent_engine(agent).name,
             "egress_override": agent.get("egress"),
             "sandboxes": [sandbox_view(r, self.cfg) for r in rows],
             "running_tasks": [t["id"] for t in running],
         }
 
     async def update_settings(self, agent: dict, patch: dict) -> dict:
-        merged = {**(agent.get("settings") or {}), **validate_settings(patch)}
+        """修改设置。改引擎（engine）等于换沙箱：维护循环和下一次请求会把旧引擎的沙箱转为 RETIRING（跑完手头任务后
+        销毁），新请求在新引擎的沙箱上执行；旧会话不能续聊。"""
+        checked = validate_settings(patch)
+        engine = checked.get("engine")
+        if engine is not None and engine not in self.enabled_engines():
+            raise InvalidRequest(f"engine {engine!r} is not enabled; enabled engines: {sorted(self.enabled_engines())}")
+        merged = {**(agent.get("settings") or {}), **checked}
+        if merged.get("engine") is None:
+            merged.pop("engine", None)
         await self.store.update_agent(agent["id"], now=self.now(), settings=merged)
         self.maintainer.kick()
         return await self.agent_info(await self.store.get_agent_by_id(agent["id"]))
@@ -254,7 +302,8 @@ class AgentService:
     async def sandbox_for(self, agent: dict, *, min_remaining_s: float = 0, wait_s: Optional[float] = None) -> dict:
         """该 agent 可接新任务的 ACTIVE 沙箱；没有就创建（后台）并等待就绪。
 
-        剩余寿命不足 min_remaining_s 的沙箱转为 RETIRING（跑完手头任务后销毁），新任务去新沙箱。
+        剩余寿命不足 min_remaining_s、或引擎与 agent 设置不一致（切换了引擎）的沙箱转为 RETIRING（跑完手头任务后
+        销毁），新任务去新沙箱。
         """
         wait_s = self.cfg.agent_wait_sandbox_s if wait_s is None else wait_s
         deadline = self.now() + wait_s
@@ -267,6 +316,19 @@ class AgentService:
             active = [r for r in rows if r["state"] == SandboxState.ACTIVE.value]
             if active:
                 row = active[0]
+                if self.engine_for(row).name != self.agent_engine(agent).name:
+                    # 传入的 agent 可能读于引擎切换之前（在途请求）：以库里最新的设置为准，否则会把新引擎的沙箱当成
+                    # 「切换了引擎」转为 RETIRING，再按旧快照建旧引擎的沙箱（PI-L1）
+                    agent = await self.store.get_agent_by_id(agent["id"]) or agent
+                engine = self.agent_engine(agent)
+                if self.engine_for(row).name != engine.name:
+                    if await self.store.cas_sandbox(
+                        row["id"], [SandboxState.ACTIVE], now=now, expect_version=row["version"], state=SandboxState.RETIRING
+                    ):
+                        log.info("sandbox %s retiring: agent switched engine to %s", row["provider_id"], engine.name)
+                        await self.lc.event("agent_engine_switch", sandbox_row_id=row["id"],
+                                            detail=f"{self.engine_for(row).name} -> {engine.name}")
+                    continue
                 if min_remaining_s and self.hard_deadline(row) - now < min_remaining_s:
                     if await self.store.cas_sandbox(
                         row["id"], [SandboxState.ACTIVE], now=now, expect_version=row["version"], state=SandboxState.RETIRING
@@ -280,9 +342,13 @@ class AgentService:
                     raise SandboxOpError(
                         f"agent sandbox failed to start {attempts} times: {self._boot_errors.get(agent['id'], 'unknown')}"
                     )
+                # 建沙箱按库里最新的引擎设置（同上，PI-L1）
+                agent = await self.store.get_agent_by_id(agent["id"]) or agent
+                engine = self.agent_engine(agent)
                 status, row = await self.store.reserve_agent_sandbox(
                     agent_id=agent["id"],
-                    template=self.cfg.agent_template,
+                    template=engine.template,
+                    engine=engine.name,
                     now=now,
                     owner=self.replica_id,
                     op_deadline=now + self.cfg.agent_boot_timeout_s,
@@ -298,18 +364,20 @@ class AgentService:
             await asyncio.sleep(_SANDBOX_POLL_S)
 
     async def _boot(self, row: dict, agent: dict) -> None:
-        """CREATING → WARMING → ACTIVE：建沙箱（出网规则 + 凭证注入）、等 opencode 健康、写配置文件、预加载实例。"""
+        """CREATING → WARMING → ACTIVE：建沙箱（出网规则 + 凭证注入）、等沙箱内 agent 服务健康、写配置文件、预加载实例。"""
         provider_id = None
         t0 = time.perf_counter()
         try:
+            engine = self.engine_for(row)
             policy = self.effective_policy(agent)
             version = network_version(policy, self.injections)
             timeout = self.cfg.agent_platform_timeout_s
             app = await self.provider.create_app(
-                self.cfg.agent_template,
-                {"pool": self.cfg.agent_pool_name, "pool_row": row["id"], "agent": agent["id"], "replica": self.replica_id},
+                engine.template,
+                {"pool": self.cfg.agent_pool_name, "pool_row": row["id"], "agent": agent["id"], "replica": self.replica_id,
+                 "engine": engine.name},
                 timeout,
-                port=self.cfg.agent_port,
+                port=engine.port,
                 network=build_network(policy, self.injections),
             )
             provider_id = app.sandbox_id
@@ -338,7 +406,7 @@ class AgentService:
             await self._wait_healthy(client, timeout_s=self.cfg.agent_boot_timeout_s / 2)
             fresh_agent = await self.store.get_agent_by_id(agent["id"]) or agent
             await self._write_agent_files(row, fresh_agent, policy, version)
-            # 预加载工作目录的实例（读取 opencode.json、连接 MCP），首个请求不必等
+            # 预加载（opencode：读取工作目录的 opencode.json、连接 MCP），首个请求不必等
             await client.status()
             now = self.now()
             ok = await self.store.activate_sandbox(
@@ -388,7 +456,7 @@ class AgentService:
             except Exception as e:  # noqa: BLE001
                 last = e
             await asyncio.sleep(0.5)
-        raise RuntimeError(f"opencode not healthy within {timeout_s:.0f}s: {last!r}")
+        raise RuntimeError(f"agent service in sandbox not healthy within {timeout_s:.0f}s: {last!r}")
 
     async def _kill_quietly(self, provider_id: str) -> None:
         try:
@@ -396,37 +464,37 @@ class AgentService:
         except Exception:  # noqa: BLE001 - 留给对账清理
             log.exception("kill %s failed, leaving it to reconcile", provider_id)
 
-    def _agent_files(self, agent: dict, policy: EgressPolicy, version: str, *, with_config: bool) -> dict[str, bytes]:
+    def _agent_files(
+        self, engine: Optional[Engine], agent: dict, policy: EgressPolicy, version: str
+    ) -> dict[str, bytes]:
+        """写进沙箱的文件：egress.json（与引擎无关），engine 不为空时再加上该引擎的配置文件。"""
         egress = {**describe(policy, self.injections, version), "applied_at": self.now()}
         files = {EGRESS_FILE: json.dumps(egress, ensure_ascii=False, indent=2).encode()}
-        if with_config:
+        if engine is not None:
             settings = self.agent_settings(agent)
-            mcp = {**self.default_mcp, **settings["mcp"]}
-            files[f"{self.cfg.agent_workdir}/opencode.json"] = json.dumps(
-                render_opencode_config(self.cfg.agent_model, mcp), ensure_ascii=False, indent=2
-            ).encode()
-            files[f"{self.cfg.agent_workdir}/AGENTS.md"] = render_agents_md(
+            files.update(engine.render_files(FilesContext(
                 workdir=self.cfg.agent_workdir,
                 max_life_h=self.cfg.agent_max_life_s / 3600,
                 idle_destroy_after_s=settings["idle_destroy_after_s"],
-                mcp_names=sorted(mcp),
+                mcp={**self.default_mcp, **settings["mcp"]},
                 egress=egress,
                 instructions=settings["instructions"],
-            ).encode()
+            )))
         return files
 
     async def _write_agent_files(self, row: dict, agent: dict, policy: EgressPolicy, version: str) -> None:
         await self.provider.write_files(
-            row["provider_id"], self._agent_files(agent, policy, version, with_config=True),
+            row["provider_id"], self._agent_files(self.engine_for(row), agent, policy, version),
             sandbox_timeout_s=self.platform_timeout_for(row),
         )
 
     async def apply_settings(self, row: dict, agent: dict) -> bool:
-        """设置变更：重写 opencode.json / AGENTS.md，重载工作目录实例。
+        """设置变更：重写引擎的配置文件（opencode.json / pi.json、AGENTS.md 等），让沙箱内 agent 重新加载。
 
-        重载（dispose）会中止沙箱里所有运行中的会话（opencode 实例销毁时取消全部会话），所以先在池级锁内确认沙箱
-        没有运行中任务并占住它，期间新任务的准入会等待（AgentStore.begin_reload / create_task）。整体限时，保证 dispose
-        不会在占用过期之后才发出。有任务在跑或其他副本正在重载时返回 False，维护循环下一轮再试。
+        opencode 的重载（dispose）会中止沙箱里所有运行中的会话（实例销毁时取消全部会话）；pi 桥接进程只重启空闲的
+        会话进程。两种引擎都先在池级锁内确认沙箱没有运行中任务并占住它，期间新任务的准入会等待
+        （AgentStore.begin_reload / create_task）。整体限时，保证 dispose 不会在占用过期之后才发出。有任务在跑或其他
+        副本正在重载时返回 False，维护循环下一轮再试。
         """
         now = self.now()
         if not await self.store.begin_reload(
@@ -455,7 +523,7 @@ class AgentService:
         version = network_version(policy, self.injections)
         await self.provider.update_network(row["provider_id"], build_network(policy, self.injections))
         await self.provider.write_files(
-            row["provider_id"], self._agent_files(agent, policy, version, with_config=False),
+            row["provider_id"], self._agent_files(None, agent, policy, version),
             sandbox_timeout_s=self.platform_timeout_for(row),
         )
         ok = await self.store.cas_sandbox(row["id"], [row["state"]], now=self.now(), network_version=version)
@@ -530,12 +598,21 @@ class AgentService:
         agent_name: Optional[str] = None,
     ) -> TaskRunner:
         max_d = min(max_duration_s or self.cfg.agent_task_max_duration_s, self.cfg.agent_task_max_duration_s)
+        engine = self.agent_engine(agent)
+        if agent_name and not engine.supports_agent_param:
+            raise InvalidRequest(f"engine {engine.name} does not support the agent parameter")
         if session_id:
             row_id = await self.store.session_sandbox(agent["id"], session_id)
             row = await self.store.get_sandbox(row_id) if row_id else None
             if row is None or row["state"] != SandboxState.ACTIVE.value:
                 raise TaskConflict(
                     f"session {session_id} is no longer available (its sandbox was rotated or destroyed); start a new session"
+                )
+            if self.engine_for(row).name != engine.name:
+                # 刚切换了引擎、维护循环还没把旧沙箱转为 RETIRING：与切换后的语义一致，旧会话不能续聊
+                raise TaskConflict(
+                    f"session {session_id} belongs to engine {self.engine_for(row).name}, but the agent now uses "
+                    f"{engine.name}; start a new session"
                 )
             max_d = min(max_d, self.hard_deadline(row) - self.now() - 60)
             if max_d < 60:
@@ -668,12 +745,13 @@ class AgentService:
             client = self.client_for(row)
             try:
                 # 已产生的输出：取当前消息补发一次文本
-                text, _, _ = extract_result(await client.messages(task["session_id"]))
+                text, _, _ = self.engine_for(row).extract_result(await client.messages(task["session_id"]))
                 if text:
                     out.put_nowait(("text", {"delta": text, "snapshot": True}))
             except Exception as e:  # noqa: BLE001
                 log.info("attach snapshot failed: %r", e)
-            tr = Translator(task["session_id"])
+            engine = self.engine_for(row)
+            tr = engine.translator(task["session_id"])
             tr.busy_seen = True
             events: asyncio.Queue = asyncio.Queue()
 
@@ -860,6 +938,8 @@ class AgentService:
             "replica": self.replica_id,
             "template": self.cfg.agent_template,
             "model": self.cfg.agent_model,
+            "engines": {n: {"template": e.template, "model": e.model} for n, e in self.enabled_engines().items()},
+            "default_engine": self.cfg.agent_default_engine,
             "sandboxes": {"total": sum(counts.values()), **counts},
             "running_tasks": len(await self.store.running_tasks()),
             "local_runners": len(self.runners),
