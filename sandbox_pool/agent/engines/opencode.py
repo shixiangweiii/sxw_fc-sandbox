@@ -25,6 +25,8 @@ class Translator:
     - 用户消息的部件（提示词本身）不输出：message.updated 先于对应部件到达，记下每条消息的角色；
     - 文本增量来自 message.part.delta；部件类型未知时先缓存，等 message.part.updated 带来类型再发出；
       只有 message.part.updated（没有增量）的文本，按已输出长度补发剩余部分；
+    - 缓存的增量不是部件全文的开头：订阅时部件已在输出（断线重连、接管），错过了开头（opencode 只在部件开始与结束时
+      发 message.part.updated，增量不落盘），丢弃缓存，按全文输出（R3-N1）；
     - 工具部件在状态变化时输出（running / completed / error），输入输出截断。
     """
 
@@ -39,6 +41,8 @@ class Translator:
         self.idle = False
         self.errors: list[str] = []
         self.asks: list[tuple[str, str]] = []  # (permission | question, request id)
+        self.round_starts = 0
+        self.mid_round = False
 
     def _emit_text(self, part_id: str, kind: str, delta: str, out: list) -> None:
         if not delta:
@@ -55,6 +59,8 @@ class Translator:
         if kind == "message.updated":
             info = props.get("info") or {}
             if info.get("id"):
+                if info.get("role") == "user" and info["id"] not in self.roles:
+                    self.round_starts += 1
                 self.roles[info["id"]] = info.get("role", "")
         elif kind == "message.part.delta":
             if self.roles.get(props.get("messageID")) == "user" or props.get("field", "text") != "text":
@@ -73,8 +79,10 @@ class Translator:
             self.part_types[part_id] = ptype
             if ptype in ("text", "reasoning"):
                 buffered = "".join(self.pending.pop(part_id, []))
-                self._emit_text(part_id, ptype, buffered, out)
                 full = part.get("text") or ""
+                if buffered and full and not full.startswith(buffered):
+                    buffered = ""  # 部件中段的片段：以全文为准
+                self._emit_text(part_id, ptype, buffered, out)
                 done = self.emitted.get(part_id, 0)
                 if len(full) > done:
                     self._emit_text(part_id, ptype, full[done:], out)
@@ -158,6 +166,16 @@ def extract_result(messages: list[dict]) -> tuple[str, dict, Optional[str]]:
     return text, usage, error
 
 
+def last_prompt(messages: list[dict]) -> Optional[str]:
+    """最后一条用户消息的文本（不含 opencode 自己插入的 synthetic 部件，例如 plan 模式的提示）。"""
+    for m in reversed(messages):
+        if (m.get("info") or {}).get("role") == "user":
+            return "".join(
+                p.get("text") or "" for p in m.get("parts") or [] if p.get("type") == "text" and not p.get("synthetic")
+            )
+    return None
+
+
 class OpencodeEngine(Engine):
     name = "opencode"
     supports_agent_param = True
@@ -167,6 +185,9 @@ class OpencodeEngine(Engine):
 
     def extract_result(self, messages: list[dict]) -> tuple[str, dict, Optional[str]]:
         return extract_result(messages)
+
+    def last_prompt(self, messages: list[dict]) -> Optional[str]:
+        return last_prompt(messages)
 
     def render_files(self, ctx: FilesContext) -> dict[str, bytes]:
         return {

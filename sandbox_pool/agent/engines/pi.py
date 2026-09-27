@@ -34,7 +34,9 @@ class PiTranslator:
     - 工具在 tool_execution_start（running）和 tool_execution_end（completed / error）时输出，输入取自 start；
     - 完成判定：agent_settled（agent_end 之后还可能有自动重试、压缩、排队消息）；
     - 不把 message_end 里的错误记为本轮错误：自动重试成功后历史里仍有失败的那条，最终错误由 extract_result 按最后一条
-      assistant 判定；只有进程丢失（pi.run_lost）记为错误。
+      assistant 判定；只有进程丢失（pi.run_lost）记为错误；
+    - mid_round（断线重连、接管）：没看到 message_start 的 assistant 消息是订阅之前就开始输出的，增量缺了开头，
+      而 RPC 的 message_update 不带累积内容：不转发增量，等 message_end 按全文输出（R3-N1）。
     """
 
     def __init__(self, session_id: str):
@@ -43,7 +45,12 @@ class PiTranslator:
         self.idle = False
         self.errors: list[str] = []
         self.asks: list[tuple[str, str]] = []
+        self.round_starts = 0
+        self.mid_round = False
         self.tool_args: dict[str, object] = {}
+        # 当前 assistant 消息：看到了它的 message_start / 增量没有转发（缺开头，等 message_end）
+        self._msg_open = False
+        self._msg_held = False
 
     def feed(self, ev: dict) -> list[tuple[str, dict]]:
         out: list[tuple[str, dict]] = []
@@ -65,12 +72,31 @@ class PiTranslator:
         t = e.get("type")
         if t == "agent_start":
             self.busy_seen = True
+            self.round_starts += 1
+        elif t == "message_start":
+            if (e.get("message") or {}).get("role") == "assistant":
+                self._msg_open = True
         elif t == "message_update":
             ame = e.get("assistantMessageEvent") or {}
-            if ame.get("type") == "text_delta" and ame.get("delta"):
+            if self.mid_round and not self._msg_open:
+                self._msg_held = True
+            elif ame.get("type") == "text_delta" and ame.get("delta"):
                 out.append(("text", {"delta": ame["delta"]}))
             elif ame.get("type") == "thinking_delta" and ame.get("delta"):
                 out.append(("reasoning", {"delta": ame["delta"]}))
+        elif t == "message_end":
+            m = e.get("message") or {}
+            if m.get("role") == "assistant":
+                if self._msg_held:
+                    content = m.get("content")
+                    thinking = "".join(c.get("thinking") or "" for c in content or []
+                                       if isinstance(c, dict) and c.get("type") == "thinking")
+                    text = _content_text(content)
+                    if thinking:
+                        out.append(("reasoning", {"delta": thinking}))
+                    if text:
+                        out.append(("text", {"delta": text}))
+                self._msg_open = self._msg_held = False
         elif t == "tool_execution_start":
             args = e.get("args")
             self.tool_args[e.get("toolCallId") or ""] = args
@@ -129,6 +155,13 @@ def extract_result(messages: list[dict]) -> tuple[str, dict, Optional[str]]:
     return text, usage, error
 
 
+def last_prompt(messages: list[dict]) -> Optional[str]:
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            return _content_text(m.get("content"))
+    return None
+
+
 def mcp_servers(mcp: dict) -> dict:
     """网关的 MCP 配置（opencode 格式，policy.validate_mcp）→ pi-mcp-adapter 的 mcpServers。
 
@@ -173,6 +206,9 @@ class PiEngine(Engine):
 
     def extract_result(self, messages: list[dict]) -> tuple[str, dict, Optional[str]]:
         return extract_result(messages)
+
+    def last_prompt(self, messages: list[dict]) -> Optional[str]:
+        return last_prompt(messages)
 
     def render_files(self, ctx: FilesContext) -> dict[str, bytes]:
         servers = mcp_servers(ctx.mcp)

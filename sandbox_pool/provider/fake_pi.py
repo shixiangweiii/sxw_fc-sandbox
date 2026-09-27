@@ -8,12 +8,15 @@
 - 重载配置（dispose）不中止运行中的会话；
 - 运行中进程崩溃：run 记为 lost 并发 pi.run_lost；桥接进程重启（restart）后旧 run 查询为 unknown；
 - 中止后最后一条 assistant 为 stopReason=error、errorMessage="This operation was aborted"；
+- 每条消息 message_start → （assistant：message_update 增量）→ message_end（带全文），增量事件不带累积内容；
+  断线重连靠 message_start 判断是否错过了消息开头（R3-N1）；
 - 以 / 开头、命中扩展命令的提示词（加载了 pi-mcp-adapter 时的 /mcp、/pi-mcp、/mcp-auth）当作命令执行，不产生运行、
   没有任何事件（pi agent-session.ts 的 prompt()，命令名按第一个空格切分）。pi 0.87.1 的 prompt 响应不带 disposition，
   桥接进程无从得知，会话一直 busy、run 一直 running，中止也清不掉（本机真实桥接进程 + pi 0.87.1 实测，PI-H1）。
 
 提示词指令（可组合）：[sleep:秒]、[tool]、[error]、[reasoning]、[retry]、[remember]、[crash]（进程崩溃）、
-[ui]（扩展对话框请求，桥接进程自动应答）。其余回复 "echo: <提示词>"。
+[ui]（扩展对话框请求，桥接进程自动应答）、[partial]（[sleep] 之前先完成一条文本为 "PARTIAL " 的 assistant 消息，
+验证运行中途重连的补发）。其余回复 "echo: <提示词>"。
 """
 
 import asyncio
@@ -145,20 +148,39 @@ class FakePiServer:
         s["messages"].append(user)
         self.emit_pi(sid, {"type": "agent_start"})
         self.emit_pi(sid, {"type": "turn_start"})
+        self.emit_pi(sid, {"type": "message_start", "message": user})
         self.emit_pi(sid, {"type": "message_end", "message": user})
         content: list[dict] = []
         stop, error, reasoning = "stop", None, 0
+        opened = False
+
+        def open_reply() -> None:
+            """与真实 pi 一致：assistant 消息先 message_start，再增量，最后 message_end（带全文）。"""
+            nonlocal opened
+            if not opened:
+                opened = True
+                self.emit_pi(sid, {"type": "message_start", "message": {"role": "assistant", "content": [], "timestamp": _ms()}})
+
         try:
             if "[retry]" in text:
                 failed = {"role": "assistant", "content": [], "usage": _usage(0, 0), "stopReason": "error",
                           "errorMessage": "429 rate limited", "timestamp": _ms()}
                 s["messages"].append(failed)
+                self.emit_pi(sid, {"type": "message_start", "message": {**failed, "content": []}})
                 self.emit_pi(sid, {"type": "message_end", "message": failed})
                 self.emit_pi(sid, {"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3, "delayMs": 10,
                                    "errorMessage": "429 rate limited"})
                 await asyncio.sleep(0.02)
                 self.emit_pi(sid, {"type": "auto_retry_end", "success": True, "attempt": 1})
+            if "[partial]" in text:
+                self.emit_pi(sid, {"type": "message_start", "message": {"role": "assistant", "content": [], "timestamp": _ms()}})
+                await self._stream(sid, "text_delta", "PARTIAL ")
+                partial = {"role": "assistant", "content": [{"type": "text", "text": "PARTIAL "}], "usage": _usage(0, 8),
+                           "stopReason": "toolUse", "timestamp": _ms()}
+                s["messages"].append(partial)
+                self.emit_pi(sid, {"type": "message_end", "message": partial})
             if "[reasoning]" in text:
+                open_reply()
                 await self._stream(sid, "thinking_delta", "先想一想这个问题。")
                 content.append({"type": "thinking", "thinking": "先想一想这个问题。"})
                 reasoning = 8
@@ -189,6 +211,7 @@ class FakePiServer:
                     reply = f"remembered: {prev['content'] if prev else '(nothing)'}"
                 else:
                     reply = f"echo: {text}"
+                open_reply()
                 await self._stream(sid, "text_delta", reply)
                 content.append({"type": "text", "text": reply})
         except asyncio.CancelledError:
@@ -198,6 +221,7 @@ class FakePiServer:
         assistant = {"role": "assistant", "content": content, "usage": _usage(len(text), sum(len(c.get("text", "")) for c in content), reasoning),
                      "stopReason": stop, "timestamp": _ms(), **({"errorMessage": error} if error else {})}
         s["messages"].append(assistant)
+        open_reply()
         self.emit_pi(sid, {"type": "message_end", "message": assistant})
         self.emit_pi(sid, {"type": "turn_end", "message": assistant, "toolResults": []})
         self.emit_pi(sid, {"type": "agent_end", "messages": [user, assistant], "willRetry": False})

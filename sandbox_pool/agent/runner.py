@@ -8,6 +8,8 @@
   只跟进到结束并落库。
 - 完成判定以事件为主（opencode：session.status 从 busy 回到 idle；pi：agent_settled），同时定期轮询 /session/status 兜底
   （事件流断开、重连期间）。
+- 中止（用户请求、超过最长执行时间）按会话生效，只由 runner 在确认仍持有任务之后下发：任务在库里 RUNNING 期间同一会话
+  不会准入新任务，命令不会落到后来的任务上（R3-01）。其他副本收到的中止请求只写库，runner 每秒读库查到。
 - 支持 run_id 的引擎（pi）：跟进结束后确认这次运行还在；沙箱内进程重启过（run 丢失）就记为失败，不把残缺结果当成功。
 """
 
@@ -29,6 +31,8 @@ log = logging.getLogger(__name__)
 _HISTORY_MAX = 5000
 _MERGEABLE = ("text", "reasoning")
 _STATUS_POLL_S = 5.0
+# 多久读一次库：确认仍持有任务、查其他副本收到的中止请求（abort_requested，中止命令只由 runner 下发，见 R3-01）
+_DB_POLL_S = 1.0
 # prompt 之后多久还没见到 busy，就以 /session/status 为准判定完成（防止 busy / idle 事件都丢了的情况）
 _NO_BUSY_GRACE_S = 15.0
 # run 查询结果：这次运行已不存在（沙箱内进程或桥接进程重启过）
@@ -212,9 +216,11 @@ class TaskRunner:
                 raise RuntimeError(f"agent event stream unavailable: {ev['properties']['error']}")
 
     async def _check_abort(self, *, poll_db: bool) -> None:
-        """超过最长执行时间或收到中止请求时中止 opencode 会话。
+        """超过最长执行时间或收到中止请求时中止会话。
 
-        截止时间与本副本收到的中止请求每轮都查（不涉及 IO）；其他副本写库的中止请求随状态轮询查。
+        截止时间与本副本收到的中止请求每轮都查（不涉及 IO）；其他副本收到的中止请求只写库，poll_db 时读库查到。
+        中止按会话生效，下发前读库确认本副本仍持有任务（RUNNING 且负责副本是自己）：这期间同一会话不会准入新任务，
+        中止只会落在这个任务上（R3-01）。
         """
         if self._abort_reason is not None:
             return
@@ -223,30 +229,36 @@ class TaskRunner:
             reason = TaskState.TIMEOUT
         elif self._abort.is_set():
             reason = TaskState.ABORTED
-        elif poll_db:
+        if reason is None and not poll_db:
+            return
+        try:
             fresh = await self.svc.store.get_task(self.task_id)
-            if fresh is None or fresh["state"] != TaskState.RUNNING.value:
-                raise _LostOwnership()
-            if fresh["op_owner"] != self.svc.replica_id:
-                raise _LostOwnership()
-            if fresh["abort_requested"]:
-                reason = TaskState.ABORTED
-        if reason is not None:
-            self._abort_reason = reason
-            log.info("task %s: aborting (%s)", self.task_id, reason.value)
-            try:
-                await self.client.abort(self.session_id)
-            except Exception as e:  # noqa: BLE001 - 以之后的状态轮询为准
-                log.warning("task %s: abort failed: %r", self.task_id, e)
+        except Exception:  # noqa: BLE001 - 数据库抖动时下一轮再查
+            log.warning("task %s: reading task failed", self.task_id, exc_info=True)
+            return
+        if fresh is None or fresh["state"] != TaskState.RUNNING.value or fresh["op_owner"] != self.svc.replica_id:
+            raise _LostOwnership()
+        if reason is None:
+            if not fresh["abort_requested"]:
+                return
+            reason = TaskState.ABORTED
+        self._abort_reason = reason
+        log.info("task %s: aborting (%s)", self.task_id, reason.value)
+        try:
+            await self.client.abort(self.session_id)
+        except Exception as e:  # noqa: BLE001 - 以之后的状态轮询为准
+            log.warning("task %s: abort failed: %r", self.task_id, e)
 
     async def _follow(self, queue: asyncio.Queue, reader: asyncio.Task) -> Optional[tuple]:
         tr = self.engine.translator(self.session_id)
         started = time.monotonic()
         next_poll = started + _STATUS_POLL_S
+        next_db = started + _DB_POLL_S
         if self.resume:
-            # 接管：订阅前任务已在运行（错过了 busy），收到 idle 即完成；马上查一次状态（可能在无人跟进时已经结束）
-            tr.busy_seen = True
-            next_poll = started
+            # 接管：订阅前任务已在运行（错过了 busy），收到 idle 即完成；正在输出的消息错过了开头，以全文为准（R3-N1）。
+            # 马上查一次状态（可能在无人跟进时已经结束）和库里的中止请求（无人跟进期间收到的中止要由接管的副本下发）
+            tr.busy_seen = tr.mid_round = True
+            next_poll = next_db = started
         while True:
             if self._stop.is_set():
                 await self._release()
@@ -264,7 +276,10 @@ class TaskRunner:
                     break
             now = time.monotonic()
             poll = now >= next_poll
-            await self._check_abort(poll_db=poll)
+            poll_db = now >= next_db
+            if poll_db:
+                next_db = now + _DB_POLL_S
+            await self._check_abort(poll_db=poll_db)
             if poll:
                 next_poll = now + _STATUS_POLL_S
                 try:
@@ -279,8 +294,7 @@ class TaskRunner:
         for kind, data in tr.flush():
             self._publish(kind, data)
         if self._abort_reason is None and (self._abort.is_set() or await self._abort_requested_in_db()):
-            # 中止请求直接调用了 opencode 的 abort，会话可能在本副本查到中止请求之前就回到 idle
-            # （请求落在其他副本时，库里的 abort_requested 每轮状态轮询才查一次）
+            # 本轮在本副本查到中止请求之前就结束了（其他副本收到的中止请求每秒读库才查到）：按用户的请求记为中止
             self._abort_reason = TaskState.ABORTED
         messages = await self.client.messages(self.session_id)
         text, usage, error = self.engine.extract_result(messages)

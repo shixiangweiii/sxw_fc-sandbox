@@ -10,6 +10,7 @@ dispose 会取消所有运行中的会话。
 - [reasoning]  先输出一段思考；
 - [retry]      先报一次限流重试（session.status retry）；
 - [ask]        发起一次权限询问，等待回复（最多 5 秒）；
+- [partial]    处理（[sleep]）之前先输出一段文本 "PARTIAL "（单独一个文本部件，验证运行中途重连的补发）；
 - [remember]   回复同一会话里上一轮的提问内容（验证会话连续）。
 其余情况回复 "echo: <提示词>"。
 """
@@ -158,6 +159,8 @@ class FakeOpencodeServer:
                     if req in self.permission_replies:
                         break
                     await asyncio.sleep(0.01)
+            if "[partial]" in text:
+                assistant["parts"].append(await self._stream_text(sid, mid, "text", "PARTIAL "))
             m = re.search(r"\[sleep:([\d.]+)\]", text)
             if m:
                 await asyncio.sleep(float(m.group(1)))

@@ -157,6 +157,7 @@ async def test_abort_and_timeout(make_agents, provider):
     await svc.abort_task(agent, runner.task_id)
     task = await final_task(svc, runner.task_id)
     assert task["state"] == "ABORTED"
+    aborted = task["session_id"]
     with pytest.raises(TaskConflict):
         await svc.abort_task(agent, runner.task_id)
 
@@ -164,8 +165,8 @@ async def test_abort_and_timeout(make_agents, provider):
     task = await final_task(svc, runner.task_id, timeout=8)
     assert task["state"] == "TIMEOUT"
     [row] = await serving(svc, agent["id"])
-    # 中止接口与跟进任务的 runner 都会调用 abort（幂等），两个任务的会话都被中止过
-    assert len(set(provider.opencode(row["provider_id"]).aborts)) == 2
+    # 中止与超时都只由跟进任务的 runner 下发（R3-01），两个任务的会话各中止一次
+    assert provider.opencode(row["provider_id"]).aborts == [aborted, task["session_id"]]
 
 
 async def test_model_error_and_auto_reject(make_agents, provider):

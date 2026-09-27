@@ -21,7 +21,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `技术调研/…调研.md`、`技术调研/…PoC验证报告.md`：平台、opencode、pi 的实测结论；
 - `…业务接入使用手册.md`、`…测试报告.md`；
 - `代码评审/2026-09-26-opencode常驻agent子系统代码评审报告.md`：评审问题（AG-*）、取舍与修复记录；
-- `代码评审/2026-09-26-pi引擎接入代码评审报告.md`：pi 引擎接入的评审（PI-*），含桥接进程的后续项（下次重建模板时处理）。
+- `代码评审/2026-09-26-pi引擎接入代码评审报告.md`：pi 引擎接入的评审（PI-*），含桥接进程的后续项（下次重建模板时处理）；
+- `代码评审/2026-09-27-opencode进程池与pi集成-最近三次提交代码评审报告.md`：最近三次提交的评审（R3-*），第六节是二次复核、修复与遗留项。
 
 ## 常用命令
 
@@ -116,14 +117,18 @@ DEEPSEEK_API_KEY=... python scripts/pi_bridge_local_check.py --pi <pi 的 dist/b
   - opencode（`opencode serve`）与 pi（`agent/pi_bridge/pi-bridge.mjs` 桥接进程，每个会话一个 `pi --mode rpc` 子进程）。两者的控制接口路径相同，网关用同一个 HTTP 客户端；事件翻译、结果提取、配置文件渲染按引擎区分。
   - agent 的引擎存在 `agents.settings.engine`（空为 `POOL_AGENT_DEFAULT_ENGINE`）；沙箱记录存 `sandboxes.engine`（老记录为空，视为 opencode）。接管、重连、健康检查都按沙箱记录找引擎。
   - 切换引擎复用轮换：`sandbox_for` 与维护循环把引擎不一致的 ACTIVE 沙箱转为 RETIRING（空闲直接销毁）；带 `session_id` 续聊到旧引擎的沙箱返回 409。
+  - 请求拿的 agent 快照可能早于引擎切换：`sandbox_for` 按库里最新设置选沙箱（PI-L1），引擎专属参数（`agent`）在 `_start_task` 按实际沙箱的引擎再校验一次（R3-02）。
   - pi 的 `prompt_async` 返回 `run_id`（存 `tasks.run_id`）：跟进结束后查 run 状态，`lost` / `unknown`（进程或桥接进程重启过）记为 FAILED，不把残缺结果当成功。
   - 用户消息经 `engine.prompt_text()` 发送：pi 会把以 `/` 开头、命中扩展命令（`/mcp` 等）的文本当命令执行、不产生运行，0.87.1 的响应又不带 `disposition`，桥接进程会把会话永久记为忙。`PiEngine` 在前面加空格转义，不要去掉（PI-H1）。
   - 建会话、发提示词是非幂等 POST，超时不重试：读超时用 `_SLOW_POST_TIMEOUT_S`（150s），必须长于桥接进程处理它们的上限（冷启动、MCP 缓存等待、pi 的 preflight 压缩，约 141s），否则会留下无人跟进的运行（PI-M1）。
   - 桥接进程随模板发布，改它要重建模板，所以只做转发和进程管理；pi 的中止表现为 `stopReason=error`，中止状态以网关自己的标记为准。平台约束（Node 版本、CA、下载源、启动命令 16KiB 上限）见 `fc-agent-sandbox-notes.md`。
 - **任务执行**：
   - 任务由后台 `TaskRunner` 执行，HTTP 响应只读订阅队列；客户端断开不取消 runner，也不在数据库操作中途取消；
-  - runner 刷新 `tasks.op_deadline` 作为心跳，过期后其他副本 CAS 接管（`resume=True`）。
+  - runner 刷新 `tasks.op_deadline` 作为心跳，过期后其他副本 CAS 接管（`resume=True`）；
+  - **中止按会话生效**（两种引擎都没有按运行中止的接口）：`abort_task` 只写 `abort_requested`，中止命令只由跟进任务的 runner 下发，下发前读库确认仍持有任务（RUNNING 且 `op_owner` 是自己）。任务在库里 RUNNING 期间同一会话不会准入新任务，这是命令不落到后来任务上的前提；不要在别处按会话调用 abort（R3-01）。runner 每秒读一次库（`_DB_POLL_S`）；
+  - **跨副本断线重连**（`_follow_remote`）要按轮次划清归属，事件和消息都只按会话区分：快照只在会话正忙（pi 还要 run_id 一致）且最后一条用户消息是本任务的提示词时补发；订阅建立时、翻译器报告新一轮开始（`round_starts`）时立即读库，本轮结束（idle / agent_settled）后不再转发（R3-04）。重连时正在输出的消息错过了开头，以全文为准：opencode 的增量不落盘（快照里没有进行中的文本），缓存的增量不是部件全文的开头就丢弃、按结束时的全文输出；pi 的 `message_update` 不带累积内容，翻译器 `mid_round` 时没看到 `message_start` 的消息等 `message_end` 整条输出（R3-N1）。
 - **任务准入**（`AgentStore.create_task`，池级锁内）：同一事务里检查沙箱仍在服务、会话不忙、未超并发上限、沙箱不在重载配置，插入任务并记录沙箱活动时间、把版本号加一。版本号加一使维护循环按旧快照做的空闲销毁或轮换 CAS 失败，不会销毁刚接了新任务的沙箱；`touch_sandbox` 在任务结束时做同样的事。
+- **修改设置**用 `AgentStore.patch_settings`：池级锁内读最新设置、合并、写回并把版本号加一，不要按请求读到的 agent 快照整包覆盖（并发修改不同字段会互相丢失，R3-03）。
 - **重载配置**（设置变更后的 `POST /instance/dispose`）：opencode 会中止沙箱里所有运行中的会话（pi 桥接进程只重启空闲会话进程），必须与任务准入互斥：`begin_reload` 在池级锁内确认没有运行中任务，再占住 ACTIVE 行的 `op_owner` / `op_deadline`（在服务的沙箱只有这时这两列非空），期间 `create_task` 返回 reloading、请求路径等待；重载整体限时且短于占用时长。
 - **出网**：
   - 凭证只经 `network.rules` 注入：模型 Key 与 `POOL_AGENT_INJECT` 只允许管理员配置，调用方无法新增注入域名；
@@ -135,7 +140,7 @@ DEEPSEEK_API_KEY=... python scripts/pi_bridge_local_check.py --pi <pi 的 dist/b
   - 建连失败一律重试，非幂等 POST 读失败不重试；
   - 维护循环只用 HTTP 探测 `/global/health`，不调用 `connect()`。
 - **接口输出**：`access_token`（流量令牌）与 `lease_id` 一样是凭证，任何接口都不返回（`sandbox_view`、管理员列表都要去掉）。
-- **测试**：`provider/fake_opencode.py` 是内存版 opencode，提示词里的 `[sleep:秒]`、`[tool]`、`[error]`、`[ask]`、`[remember]` 等指令模拟不同行为；它与真实行为一致的两点不要去掉：客户端 close 后再调用报错、dispose 取消运行中的会话。`make_agents` 夹具可建多个副本（各自打开 store，模拟多进程）；生产中 `create_app` 让 agent 子系统共用代码执行池的数据库引擎（每进程一个 SQLite 写连接）。`tests/test_agent_review_fixes.py` 按评审编号（AG-*）组织。`provider/fake_pi.py` 是内存版 pi 桥接进程（另有 `[crash]` 指令），保留的真实语义：重载不中止运行中的会话、进程丢失后 run 为 lost、`restart()` 后旧 run 为 unknown、`/mcp` 等扩展命令不产生运行且会话一直忙（pi 0.87.1）；`FakeProvider.pi_templates` 里的模板建出 pi 沙箱。`tests/test_agent_pi.py` 末尾按评审编号（PI-*）组织。
+- **测试**：`provider/fake_opencode.py` 是内存版 opencode，提示词里的 `[sleep:秒]`、`[tool]`、`[error]`、`[ask]`、`[remember]`、`[partial]`（运行中途先产出一段文本）等指令模拟不同行为；它与真实行为一致的两点不要去掉：客户端 close 后再调用报错、dispose 取消运行中的会话。`make_agents` 夹具可建多个副本（各自打开 store，模拟多进程）；生产中 `create_app` 让 agent 子系统共用代码执行池的数据库引擎（每进程一个 SQLite 写连接）。`tests/test_agent_review_fixes.py` 按评审编号（AG-*）组织。`provider/fake_pi.py` 是内存版 pi 桥接进程（另有 `[crash]` 指令），保留的真实语义：重载不中止运行中的会话、进程丢失后 run 为 lost、`restart()` 后旧 run 为 unknown、`/mcp` 等扩展命令不产生运行且会话一直忙（pi 0.87.1）、每条消息 `message_start` → 增量 → `message_end`（带全文）；`FakeProvider.pi_templates` 里的模板建出 pi 沙箱。`tests/test_agent_pi.py` 末尾按评审编号（PI-*）组织；`tests/test_agent_r3_fixes.py` 按 R3-* 组织，并发用例对两种引擎参数化，用事件门控固定时序。
 
 **鉴权**（`api/auth.py`）：
 - `POOL_API_KEYS` / `POOL_ADMIN_KEYS`，格式「名称:key」，逗号分隔。两者都为空时关闭鉴权，此时进程拒绝监听非回环地址（除非 `--allow-no-auth`）。

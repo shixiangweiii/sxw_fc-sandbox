@@ -56,6 +56,8 @@ _MAX_BOOT_ATTEMPTS = 3
 _RELOAD_TIMEOUT_S = 60
 _RELOAD_HOLD_S = 90
 _RELOAD_POLL_S = 0.2
+# 跟随其他副本上的任务（断线重连）时多久读一次库，看任务是否已结束
+_FOLLOW_POLL_S = 1.0
 MIN_EVERY_S = 60
 
 
@@ -290,10 +292,10 @@ class AgentService:
         engine = checked.get("engine")
         if engine is not None and engine not in self.enabled_engines():
             raise InvalidRequest(f"engine {engine!r} is not enabled; enabled engines: {sorted(self.enabled_engines())}")
-        merged = {**(agent.get("settings") or {}), **checked}
-        if merged.get("engine") is None:
-            merged.pop("engine", None)
-        await self.store.update_agent(agent["id"], now=self.now(), settings=merged)
+        # 合并以库里最新的设置为准（存储层同一事务内读、合并、写）：传入的 agent 是请求开始时读的，其间可能有其他
+        # 请求改了别的字段（R3-03）。engine 为 None 表示恢复默认，从设置里删除
+        if not await self.store.patch_settings(agent["id"], checked, now=self.now()):
+            raise AgentNotFound(f"agent {agent['user_id']} not found")
         self.maintainer.kick()
         return await self.agent_info(await self.store.get_agent_by_id(agent["id"]))
 
@@ -599,6 +601,7 @@ class AgentService:
     ) -> TaskRunner:
         max_d = min(max_duration_s or self.cfg.agent_task_max_duration_s, self.cfg.agent_task_max_duration_s)
         engine = self.agent_engine(agent)
+        # 按请求读到的设置先查一次，不为注定被拒绝的请求建沙箱；以实际沙箱的引擎为准的检查在 _start_task
         if agent_name and not engine.supports_agent_param:
             raise InvalidRequest(f"engine {engine.name} does not support the agent parameter")
         if session_id:
@@ -645,6 +648,10 @@ class AgentService:
         max_duration_s: float,
         agent_name: Optional[str] = None,
     ) -> TaskRunner:
+        engine = self.engine_for(row)
+        if agent_name and not engine.supports_agent_param:
+            # 请求读到的设置可能早于引擎切换，sandbox_for 按最新设置选了另一种引擎的沙箱：按实际执行的引擎拒绝（R3-02）
+            raise InvalidRequest(f"engine {engine.name} does not support the agent parameter")
         task_id = str(uuid.uuid4())
         wait_until = time.monotonic() + self.cfg.agent_wait_sandbox_s
         while True:
@@ -696,7 +703,8 @@ class AgentService:
         return task
 
     async def attach(self, agent: dict, task_id: str) -> AsyncIterator[Optional[tuple[str, dict]]]:
-        """断线重连：本副本上的 runner 直接订阅；在其他副本上时自己订阅 opencode 事件做只读翻译，直到库里的任务结束。"""
+        """断线重连：本副本上的 runner 直接订阅；在其他副本上时自己订阅沙箱内 agent 的事件做只读翻译，
+        只转发这个任务那一轮的输出，直到库里的任务结束（_follow_remote）。"""
         task = await self.get_task(agent, task_id)
         runner = self.runners.get(task_id)
         if runner is not None:
@@ -730,6 +738,14 @@ class AgentService:
                 await asyncio.gather(follower, return_exceptions=True)
 
     async def _follow_remote(self, task: dict, out: asyncio.Queue, stop: asyncio.Event) -> None:
+        """跟随其他副本上的任务：补发本轮已有的文本，再转发翻译后的事件，直到库里的任务结束。
+
+        一个会话里会先后跑多个任务，而事件和消息都只按会话区分，要按轮次划清归属（R3-04）：
+        - 快照只在确认会话正在运行这个任务那一轮时补发（_attach_snapshot）；
+        - 这一轮结束（idle / agent_settled）之后的事件不再转发；
+        - 事件订阅建立时、会话开始新一轮时立即读库：任务已结束，说明之后的轮次属于后面的任务（任务在库里 RUNNING
+          期间同一会话不会准入新任务），就此结束，不转发它们。
+        """
         try:
             row = await self.store.get_sandbox(task["sandbox_row_id"])
             out.put_nowait(("start", {"task_id": task["id"], "session_id": task["session_id"],
@@ -740,19 +756,20 @@ class AgentService:
                     if fresh is None or fresh["state"] != TaskState.RUNNING.value:
                         out.put_nowait(("done", _task_done(fresh or task)))
                         return
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(_FOLLOW_POLL_S)
                 return
             client = self.client_for(row)
+            engine = self.engine_for(row)
             try:
-                # 已产生的输出：取当前消息补发一次文本
-                text, _, _ = self.engine_for(row).extract_result(await client.messages(task["session_id"]))
+                text = await self._attach_snapshot(client, engine, task)
                 if text:
                     out.put_nowait(("text", {"delta": text, "snapshot": True}))
             except Exception as e:  # noqa: BLE001
                 log.info("attach snapshot failed: %r", e)
-            engine = self.engine_for(row)
             tr = engine.translator(task["session_id"])
-            tr.busy_seen = True
+            # 订阅之前这一轮可能已在运行（错过了开始事件）：收到结束事件即为这一轮结束；正在输出的消息错过了开头，
+            # 以全文为准（R3-N1）
+            tr.busy_seen = tr.mid_round = True
             events: asyncio.Queue = asyncio.Queue()
 
             async def read():
@@ -764,20 +781,35 @@ class AgentService:
 
             reader = asyncio.create_task(read())
             try:
-                next_check = time.monotonic() + 1.0
+                next_check = time.monotonic() + _FOLLOW_POLL_S
+                rounds = 0
                 while not stop.is_set():
                     try:
-                        ev = await asyncio.wait_for(events.get(), timeout=1.0)
-                        for item in tr.feed(ev):
-                            out.put_nowait(item)
+                        ev = await asyncio.wait_for(events.get(), timeout=_FOLLOW_POLL_S)
                     except asyncio.TimeoutError:
-                        pass
-                    if time.monotonic() >= next_check:
-                        next_check = time.monotonic() + 1.0
+                        ev = None
+                    items: list = []
+                    check = time.monotonic() >= next_check
+                    if ev is not None:
+                        if ev.get("type") == "server.connected":
+                            # 取快照与订阅之间任务可能已经结束、会话已开始下一个任务（错过了它开始的事件）
+                            check = True
+                        else:
+                            ended = tr.idle
+                            items = tr.feed(ev)
+                            if tr.round_starts != rounds:
+                                rounds = tr.round_starts
+                                check = True
+                            if ended:
+                                items = []
+                    if check:
+                        next_check = time.monotonic() + _FOLLOW_POLL_S
                         fresh = await self.store.get_task(task["id"])
                         if fresh is None or fresh["state"] != TaskState.RUNNING.value:
                             out.put_nowait(("done", _task_done(fresh or task)))
                             return
+                    for item in items:
+                        out.put_nowait(item)
             finally:
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
@@ -785,20 +817,44 @@ class AgentService:
             log.warning("follow task %s failed: %r", task["id"], e)
             out.put_nowait(None)
 
+    async def _attach_snapshot(self, client, engine: Engine, task: dict) -> str:
+        """重连时补发的本轮已有文本。只在确认会话正在运行这个任务那一轮时补发，否则为空（R3-04）：
+
+        - 会话不忙：这一轮还没开始（提示词未送达，会话里最后一轮是上一个任务的；连续两轮提示词相同时比对文本也分不出），
+          或者已经结束（done 随后就到，带最终结果）；
+        - 支持 run_id 的引擎（pi）：正在运行的必须是这个任务的 run；
+        - 最后一条用户消息必须是这个任务的提示词（pi 桥接进程受理提示词时就记为忙，用户消息稍后才写入会话）。
+        """
+        sid = task["session_id"]
+        busy = (await client.status()).get(sid)
+        if not busy:
+            return ""
+        if engine.has_runs:
+            fresh = await self.store.get_task(task["id"])
+            if fresh is None or not fresh["run_id"] or busy.get("run_id") != fresh["run_id"]:
+                return ""
+        messages = await client.messages(sid)
+        if engine.last_prompt(messages) != engine.prompt_text(task["prompt"]):
+            return ""
+        return engine.extract_result(messages)[0]
+
     async def abort_task(self, agent: dict, task_id: str) -> dict:
+        """中止运行中的任务：只在库里记中止标记，中止命令由跟进该任务的 runner 下发（R3-01）。
+
+        引擎的中止按会话生效（opencode、pi 桥接进程都没有按运行中止的接口），这里直接下发的话，命令可能在任务结束、
+        同一会话开始下一个任务之后才到，中止掉别的任务。runner 下发前确认自己仍持有任务：任务在库里 RUNNING 期间，
+        同一会话不会准入新任务（create_task 的 session_busy）。本副本的 runner 立即处理，其他副本的 runner 每秒查一次库，
+        负责副本崩溃时由接管的副本下发。
+        """
         task = await self.get_task(agent, task_id)
         if task["state"] != TaskState.RUNNING.value:
             raise TaskConflict(f"task {task_id} is already {task['state']}")
-        await self.store.cas_task(task_id, [TaskState.RUNNING], abort_requested=1)
+        if not await self.store.cas_task(task_id, [TaskState.RUNNING], abort_requested=1):
+            task = await self.get_task(agent, task_id)
+            raise TaskConflict(f"task {task_id} is already {task['state']}")
         runner = self.runners.get(task_id)
         if runner is not None:
             runner.request_abort()
-        row = await self.store.get_sandbox(task["sandbox_row_id"])
-        if row is not None and task["session_id"]:
-            try:
-                await self.client_for(row).abort(task["session_id"])
-            except Exception as e:  # noqa: BLE001 - 跟进任务的 runner 会按 abort_requested 再次中止
-                log.warning("abort session %s failed: %r", task["session_id"], e)
         return await self.get_task(agent, task_id)
 
     # ---------- 定时任务 ----------

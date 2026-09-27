@@ -1,4 +1,4 @@
-# 常驻 agent（opencode / pi）· 测试报告（2026-09-25 ~ 09-26）
+# 常驻 agent（opencode / pi）· 测试报告（2026-09-25 ~ 09-27）
 
 > 被测对象：sandbox_pool 的 agent 子系统（见 `sxw_aicoding/方案设计/2026-09-25-opencode应用沙箱池-实施方案.md`）。
 > 环境：
@@ -7,7 +7,7 @@
 > - 模型 `deepseek/deepseek-flash`，联网搜索用百炼 WebSearch MCP。
 >
 > 云上验证（PoC）报告：`sxw_aicoding/技术调研/2026-09-25-opencode云沙箱PoC验证报告.md`。
-> 2026-09-26 新增 pi 引擎与多引擎的测试，见第 6 节。
+> 2026-09-26 新增 pi 引擎与多引擎的测试，见第 6 节；2026-09-27 最近三次提交代码评审（R3）修复后的回归见第 8 节。
 
 ## 1. 结论
 
@@ -224,4 +224,22 @@ scripts/run_local_cluster.sh start 8001 8002
 node --test sandbox_pool/agent/pi_bridge/test/bridge.test.mjs       # 桥接进程测试
 scripts/run_local_cluster.sh stop
 .venv/bin/python scripts/cleanup_sandboxes.py        # 确认账号下没有残留沙箱
+```
+
+## 8. 最近三次提交代码评审（R3）修复后的回归（2026-09-27）
+
+评审报告：`sxw_aicoding/代码评审/2026-09-27-opencode进程池与pi集成-最近三次提交代码评审报告.md`（第六节为复核、修复与验证记录）。R3-01～R3-04 全部复核成立并修复，复核中新发现的 R3-N1 一并修复；改动都在网关侧，桥接进程与模板不变。
+
+| 项 | 结果 |
+| --- | --- |
+| 修复前基线 | pytest 173 passed；桥接进程 11 passed |
+| 未修复代码上跑新用例 | 初版 18 个中 14 个失败（两种引擎都复现报告的时序），4 个正向用例通过 |
+| 新增用例 | `tests/test_agent_r3_fixes.py`：30 个（并发用例对两种引擎参数化） |
+| 反向验证 | 12 项（每个修复及其中每个机制）逐个去掉，均有对应用例失败 |
+| 全量 | **203 个**。R3-N1 修复后共跑 6 轮：5 轮全部通过，1 轮基础池用例 `test_l9_drain_destroys_idle_and_blocks_new_leases` 偶发失败（既有的时序问题，与本次改动无关，见评审报告 6.7）；R3 用例连跑 8 轮全部通过 |
+| 本机真实引擎 | opencode 1.18.32、pi 0.87.1（与模板同版本）：无效 Key 下 18/18（用户消息文本、轮次信号、忙碌状态与 run_id）；真实 DeepSeek 流式 4/4（回复输出到一半时接入的跟随者，文本与最终结果逐字一致） |
+| 云上端到端 | 本轮未执行（改动在网关侧，引擎行为已本机验证）；下次云上回归重点看 S6、S7、S10、S12 |
+
+```bash
+.venv/bin/python -m pytest tests/test_agent_r3_fixes.py      # R3 回归用例（约 40s）
 ```

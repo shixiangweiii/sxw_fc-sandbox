@@ -38,13 +38,18 @@ class Translator(Protocol):
     """把引擎事件翻译成对外事件 (kind, data)，kind ∈ text / reasoning / tool / status。
 
     busy_seen：已看到会话开始运行；idle：本轮运行已结束；errors：运行中出现的错误；
-    asks：需要应答的询问 (permission | question, 请求 ID)，只有 opencode 会产生。
+    asks：需要应答的询问 (permission | question, 请求 ID)，只有 opencode 会产生；
+    round_starts：看到会话开始新一轮的次数（opencode：新的用户消息；pi：agent_start）。一个会话里会先后跑多个任务，
+    断线重连据此划分轮次（可以多报，例如 pi 自动重试时再次 agent_start，不能漏报）；
+    mid_round：订阅时这一轮可能已在输出（断线重连、接管），错过开头的消息以全文为准（pi 等到 message_end 整条输出）。
     """
 
     busy_seen: bool
     idle: bool
     errors: list[str]
     asks: list[tuple[str, str]]
+    round_starts: int
+    mid_round: bool
 
     def feed(self, ev: dict) -> list[tuple[str, dict]]: ...
 
@@ -77,6 +82,10 @@ class Engine:
 
     def extract_result(self, messages: list[dict]) -> tuple[str, dict, Optional[str]]:
         """本轮结果：(最终文本, 用量, 错误)。"""
+        raise NotImplementedError
+
+    def last_prompt(self, messages: list[dict]) -> Optional[str]:
+        """会话里最后一条用户消息的文本（与 prompt_text 发出的提示词比对）；没有用户消息时为 None。"""
         raise NotImplementedError
 
     def render_files(self, ctx: FilesContext) -> dict[str, bytes]:

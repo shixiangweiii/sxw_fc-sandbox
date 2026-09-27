@@ -153,7 +153,7 @@ data: {"task_id": "b136…", "state": "SUCCEEDED", "result": "系统架构是 x8
 | `text` | string，必填 | 发给 agent 的消息 |
 | `session_id` | string | 继续已有会话；不传则新建会话 |
 | `max_duration_s` | number，60–86400 | 最长执行时间。超过后中止，状态为 `TIMEOUT`。默认同时受 `POOL_AGENT_TASK_MAX_DURATION_S`（4h）限制 |
-| `agent` | string | opencode 引擎的 agent（`build` 默认，`plan` 只读规划）；pi 引擎不支持，传了返回 400 |
+| `agent` | string | opencode 引擎的 agent（`build` 默认，`plan` 只读规划）；pi 引擎不支持，传了返回 400。以实际执行任务的引擎为准：切换引擎前发出、切换后才执行的请求同样按新引擎判断 |
 | `stream` | bool，默认 true | true：SSE 流式；false：等任务结束后返回任务 JSON（见 4.3） |
 
 **SSE 事件**（`text/event-stream`；没有事件时每 15 秒发送一次 `: keepalive` 注释）：
@@ -181,7 +181,7 @@ data: {"task_id": "b136…", "state": "SUCCEEDED", "result": "系统架构是 x8
 | --- | --- | --- |
 | GET | `/v1/agents/{user_id}` | 设置、当前生效的引擎 `engine`、当前沙箱（引擎、状态、创建时间、硬截止 `hard_deadline`）、运行中的任务 ID |
 | GET | `/v1/agent-engines` | 已启用的引擎、默认引擎、各自的模型与能力差异（见第 10 节） |
-| PATCH | `/v1/agents/{user_id}/settings` | 修改设置（只传要改的字段），沙箱空闲时自动应用：重写配置并重载 agent（通常 1–2 秒）。opencode 的重载会中断运行中的会话，所以只在没有任务时进行；重载期间到达的新消息会等它完成再开始。改 `engine` 则是换沙箱（第 2 节第 6 条） |
+| PATCH | `/v1/agents/{user_id}/settings` | 修改设置（只传要改的字段；并发修改不同字段互不覆盖，同一字段以后生效的请求为准），沙箱空闲时自动应用：重写配置并重载 agent（通常 1–2 秒）。opencode 的重载会中断运行中的会话，所以只在没有任务时进行；重载期间到达的新消息会等它完成再开始。改 `engine` 则是换沙箱（第 2 节第 6 条） |
 | DELETE | `/v1/agents/{user_id}/sandbox` | 重置：销毁当前沙箱（运行中任务记为失败），下次对话自动新建 |
 
 设置字段：
@@ -199,8 +199,8 @@ data: {"task_id": "b136…", "state": "SUCCEEDED", "result": "系统架构是 x8
 | --- | --- | --- |
 | GET | `/v1/agents/{user_id}/tasks` | 列表，按创建时间倒序。参数：`source`（message / schedule）、`schedule_id`、`state`、`since`（epoch 秒）、`limit`（≤500） |
 | GET | `/v1/agents/{user_id}/tasks/{task_id}` | 详情 |
-| GET | `/v1/agents/{user_id}/tasks/{task_id}/stream` | 断线重连（SSE）。任务仍在运行：先补发已有的回复文本，再接实时事件直到 `done`；已结束：直接返回 `done`。可以连任意副本 |
-| POST | `/v1/agents/{user_id}/tasks/{task_id}/abort` | 中止运行中的任务（已结束返回 409） |
+| GET | `/v1/agents/{user_id}/tasks/{task_id}/stream` | 断线重连（SSE）。任务仍在运行：先补发本轮已有的回复文本，再接实时事件直到 `done`；重连时正在输出的那条消息，等它输出完整条补发。只包含这个任务那一轮的输出，不会混入同一会话前后任务的内容。已结束：直接返回 `done`。可以连任意副本 |
+| POST | `/v1/agents/{user_id}/tasks/{task_id}/abort` | 中止运行中的任务（已结束返回 409）。异步生效：返回时任务通常仍是 `RUNNING`，约 1 秒内结束为 `ABORTED`；负责该任务的副本崩溃时，等其他副本接管后生效。只影响这个任务，不会中止同一会话之后的任务 |
 
 任务 JSON：
 

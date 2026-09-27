@@ -1,7 +1,7 @@
 """agent 子系统的数据访问：agent、agent 沙箱、任务、定时任务。沿用 Store 的约定（见 repository.py）：
 
 - 状态变更一律 CAS；
-- 「先查再写」（建 agent、给 agent 占沙箱名额、任务准入）在同一事务内先更新池级锁行再查询，多副本串行化；
+- 「先查再写」（建 agent、修改设置、给 agent 占沙箱名额、任务准入）在同一事务内先更新池级锁行再查询，多副本串行化；
 - 正常路径上不执行预期会失败的语句（不靠主键 / 唯一约束冲突判断「已存在」）。
 """
 
@@ -88,20 +88,43 @@ class AgentStore(Store):
 
         return await self._retry(fn)
 
-    async def update_agent(
-        self, agent_id: str, *, now: float, settings: Optional[dict] = None, egress: object = ...
-    ) -> bool:
-        """settings 变更时版本号加一（维护循环据此把新设置应用到沙箱）；egress 传 None 表示恢复默认策略。"""
+    async def update_agent(self, agent_id: str, *, now: float, egress: object = ...) -> bool:
+        """整体替换出网策略覆盖（PUT 语义），egress 传 None 表示恢复默认策略。设置用 patch_settings。"""
         values: dict = {"updated_at": now}
-        if settings is not None:
-            values["settings"] = json.dumps(settings, ensure_ascii=False)
-            values["settings_version"] = agents.c.settings_version + 1
         if egress is not ...:
             values["egress"] = None if egress is None else json.dumps(egress, ensure_ascii=False)
 
         async def fn(conn):
             res = await conn.execute(update(agents).where(agents.c.id == agent_id).values(**values))
             return res.rowcount == 1
+
+        return await self._retry(fn)
+
+    async def patch_settings(self, agent_id: str, patch: dict, *, now: float) -> bool:
+        """按 patch 修改设置，版本号加一（维护循环据此把新设置应用到沙箱）。值为 None 的键表示恢复默认，从设置里删除。
+
+        在同一事务里、池级锁下读最新设置再合并写回：并发修改不同字段互不覆盖，同一字段后写的生效（R3-03）。
+        返回 agent 是否存在。
+        """
+
+        async def fn(conn):
+            await self._lock(conn)
+            current = (
+                await conn.execute(select(agents.c.settings).where(agents.c.id == agent_id))
+            ).scalar_one_or_none()
+            if current is None:
+                return False
+            merged = {k: v for k, v in {**json.loads(current or "{}"), **patch}.items() if v is not None}
+            await conn.execute(
+                update(agents)
+                .where(agents.c.id == agent_id)
+                .values(
+                    settings=json.dumps(merged, ensure_ascii=False),
+                    settings_version=agents.c.settings_version + 1,
+                    updated_at=now,
+                )
+            )
+            return True
 
         return await self._retry(fn)
 
