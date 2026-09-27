@@ -418,6 +418,11 @@ async def test_r3_04_reattach_mid_round_still_replays_this_rounds_text(make_agen
     prompt = "[partial][sleep:0.6] THIS_ROUND"
     t = await a.start_message(agent, prompt, session_id=sid)
     await wait_until(lambda: "PARTIAL" in json.dumps(server.sessions[sid]["messages"]))
+    if engine == "pi":  # 快照按身份绑定：等 runner 记下本轮用户消息的身份
+        async def key_saved():
+            return (await a.store.get_task(t.task_id))["prompt_key"]
+
+        await wait_until(key_saved)
     items: list = []
     await asyncio.wait_for(_follow(b, agent, t.task_id, items), 5)
 
@@ -491,3 +496,159 @@ def test_r3_n1_pi_translator_holds_message_joined_mid_way_until_message_end():
     tr = PiTranslator("s")
     out = [i for e in (start, update("text_delta", "hello "), update("text_delta", "world"), end) for i in tr.feed(e)]
     assert out == [("text", {"delta": "hello "}), ("text", {"delta": "world"})]
+
+
+# ---------- 验收报告（2026-09-27-9f265ba修复二次复核与真实云沙箱验证报告.md）第三节的两个残留 ----------
+
+
+async def test_r3_01_stalled_old_runner_cannot_abort_the_next_task_after_takeover(make_agents, provider, engine, monkeypatch):
+    """（验收报告 3.1）A 确认仍持有 T1、开始下发中止后停住（心跳也停），心跳过期后 B 正常接管，按中止标记中止并结束 T1，
+    同一会话随即提交 T2。A 恢复后的迟到中止不能落在 T2 上：中止下发前先在库里占住会话，限时下发，占用期间同一会话
+    不准入新任务。"""
+    import sandbox_pool.agent.runner as runner_mod
+
+    # 与验收报告的时序一致：接管（约 1.3s）发生在 A 的下发时限之内，占用与限时两个机制都要起作用
+    monkeypatch.setattr(runner_mod, "_ABORT_TIMEOUT_S", 2.5, raising=False)
+    monkeypatch.setattr(runner_mod, "_ABORT_HOLD_S", 4.0, raising=False)
+    a, b = await _replicas(make_agents, engine)
+    agent = await a.ensure_agent("biz", "u1")
+    t1 = await a.start_message(agent, "[sleep:30] FIRST")
+    sid = await _started(t1)
+    [row] = await serving(a, agent["id"])
+    server = _server(provider, row)
+    await wait_until(lambda: sid in server.busy())
+
+    release, entered = asyncio.Event(), asyncio.Event()
+    orig_cas, orig_abort = a.store.cas_task, t1.client.abort
+    delivered: list = []
+
+    async def held_heartbeat(*args, **kw):
+        if "op_deadline" in kw and "state" not in kw:  # 心跳
+            await release.wait()
+        return await orig_cas(*args, **kw)
+
+    async def held_abort(session_id, **kw):
+        entered.set()
+        await release.wait()
+        delivered.append(session_id)
+        return await orig_abort(session_id, **kw)
+
+    a.store.cas_task, t1.client.abort = held_heartbeat, held_abort
+    try:
+        await a.abort_task(agent, t1.task_id)
+        await asyncio.wait_for(entered.wait(), 5)
+        await asyncio.sleep(1.3)  # A 的心跳过期（接管时限 1s）；A 的下发仍在时限内、停在路上
+        await b.maintainer.takeover_tasks(b.now())
+        assert (await final_task(b, t1.task_id))["state"] == TaskState.ABORTED.value
+        t_admit = time.monotonic()
+        t2 = await b.start_message(agent, "[sleep:0.5] SECOND", session_id=sid)
+        admitted_after = time.monotonic() - t_admit
+        await wait_until(lambda: sid in server.busy())
+        release.set()
+        task2 = await final_task(b, t2.task_id)
+    finally:
+        release.set()  # 用例失败时也放行：否则 A 的心跳一直停着，清理时等不到它的 runner 结束
+
+    assert task2["state"] == TaskState.SUCCEEDED.value, task2["error"]
+    assert task2["result_text"] == "echo: [sleep:0.5] SECOND"
+    assert not delivered  # A 的中止在下发时限内就被取消，没有发出
+    # 接管前 A 的占用还没到期（B 的占用不是独占的，不提前释放）：T2 等 A 的下发时限过去之后才准入
+    assert admitted_after > 1.0
+
+
+async def test_r3_01_fence_released_after_successful_abort_does_not_delay_next_task(make_agents, engine, monkeypatch):
+    """正常路径：中止成功、且期间没有别的副本也在中止时，立即释放会话占用；同一会话的下一条消息不用等占用到期。"""
+    import sandbox_pool.agent.runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "_ABORT_HOLD_S", 30.0, raising=False)
+    svc = await make_agents(run_maintainer=False, **ENGINES[engine])
+    agent = await svc.ensure_agent("biz", "u1")
+    t1 = await svc.start_message(agent, "[sleep:30] FIRST")
+    sid = await _started(t1)
+    await svc.abort_task(agent, t1.task_id)
+    assert (await final_task(svc, t1.task_id))["state"] == TaskState.ABORTED.value
+    assert (await svc.store.get_task(t1.task_id)).get("abort_fence_until") is None
+    t0 = time.monotonic()
+    t2 = await svc.start_message(agent, "SECOND", session_id=sid)
+    assert time.monotonic() - t0 < 1
+    assert (await final_task(svc, t2.task_id))["state"] == TaskState.SUCCEEDED.value
+
+
+async def test_r3_04_snapshot_fetched_after_round_switch_is_not_sent(make_agents, provider, engine):
+    """（验收报告 3.2）快照的入口检查（会话正忙；pi 还有 run_id 与本轮用户消息）都通过之后，取消息期间 T1 结束、同一会话的
+    T2（提示词相同）也跑完：取到的最后一轮是 T2 的，不能当成 T1 的快照发出。"""
+    a, b = await _replicas(make_agents, engine)
+    agent = await a.ensure_agent("biz", "u1")
+    prompt = "[round][sleep:0.3] SAME"
+    t1 = await a.start_message(agent, prompt)
+    sid = await _started(t1)
+    [row] = await serving(a, agent["id"])
+    server = _server(provider, row)
+
+    async def entry_ready():
+        task = await a.store.get_task(t1.task_id)
+        if engine == "pi" and not (task["run_id"] and task.get("prompt_key", "unused")):
+            return False
+        return sid in server.busy()
+
+    await wait_until(entry_ready)
+    client = b.client_for(row)
+    entered, release = asyncio.Event(), asyncio.Event()
+    orig = client.messages
+
+    async def held_messages(session_id):
+        entered.set()
+        await release.wait()
+        return await orig(session_id)
+
+    client.messages = held_messages
+    items: list = []
+    follower = asyncio.create_task(_follow(b, agent, t1.task_id, items))
+    await asyncio.wait_for(entered.wait(), 5)
+    assert (await final_task(a, t1.task_id))["result_text"] == f"echo: {prompt} #1"
+    t2 = await a.start_message(agent, prompt, session_id=sid)
+    assert (await final_task(a, t2.task_id))["result_text"] == f"echo: {prompt} #2"
+    release.set()
+    await asyncio.wait_for(follower, 5)
+
+    assert not [d for k, d in items if k == "text" and d.get("snapshot")], items
+    assert items[-1][0] == "done" and items[-1][1]["result"] == f"echo: {prompt} #1"
+
+
+async def test_r3_04_pi_snapshot_requires_this_runs_user_message(make_agents, provider):
+    """pi 受理提示词（run_id 已入库、会话已忙）之后，还要经过几次 await（agent_start、turn_start 等事件与扩展钩子）才把
+    用户消息写进会话；这期间最后一轮仍是上一个任务的，提示词相同时比对文本分不出。快照要求会话里最后一条用户消息
+    正是这次运行的（runner 从带同一 runID 的事件记下它的身份）。"""
+    a, b = await _replicas(make_agents, "pi")
+    agent = await a.ensure_agent("biz", "u1")
+    prompt = "[round] SAME"
+    sid = (await collect(await a.start_message(agent, prompt)))[-1][1]["session_id"]
+    [row] = await serving(a, agent["id"])
+    server = _server(provider, row)
+
+    gate = asyncio.Event()
+    orig_run = server._run
+
+    async def gated_run(session_id, text):
+        await gate.wait()  # 已受理、会话已忙，用户消息还没写入
+        await orig_run(session_id, text)
+
+    server._run = gated_run
+    t = await a.start_message(agent, prompt, session_id=sid)
+
+    async def accepted():
+        return (await a.store.get_task(t.task_id))["run_id"] and sid in server.busy()
+
+    await wait_until(accepted)
+    before = len(server.subscribers)
+    items: list = []
+    follower = asyncio.create_task(_follow(b, agent, t.task_id, items))
+    await wait_until(lambda: len(server.subscribers) > before)
+    await asyncio.sleep(0.05)
+    server._run = orig_run
+    gate.set()
+    await asyncio.wait_for(follower, 5)
+
+    assert not [d for k, d in items if k == "text" and d.get("snapshot")], items
+    assert _text(items) == f"echo: {prompt} #2"
+    assert items[-1][0] == "done" and items[-1][1]["result"] == f"echo: {prompt} #2"

@@ -41,7 +41,9 @@ class Translator(Protocol):
     asks：需要应答的询问 (permission | question, 请求 ID)，只有 opencode 会产生；
     round_starts：看到会话开始新一轮的次数（opencode：新的用户消息；pi：agent_start）。一个会话里会先后跑多个任务，
     断线重连据此划分轮次（可以多报，例如 pi 自动重试时再次 agent_start，不能漏报）；
-    mid_round：订阅时这一轮可能已在输出（断线重连、接管），错过开头的消息以全文为准（pi 等到 message_end 整条输出）。
+    mid_round：订阅时这一轮可能已在输出（断线重连、接管），错过开头的消息以全文为准（pi 等到 message_end 整条输出）；
+    run_id / prompt_key：支持 run_id 的引擎（pi）由 runner 设置本轮的 run_id，翻译器从带同一 runID 的用户消息事件记下
+    它的身份（prompt_key，与 Engine.last_prompt_key 对应），断线重连据此确认快照属于本任务；其他引擎保持 None。
     """
 
     busy_seen: bool
@@ -50,6 +52,8 @@ class Translator(Protocol):
     asks: list[tuple[str, str]]
     round_starts: int
     mid_round: bool
+    run_id: Optional[str]
+    prompt_key: Optional[str]
 
     def feed(self, ev: dict) -> list[tuple[str, dict]]: ...
 
@@ -87,6 +91,10 @@ class Engine:
     def last_prompt(self, messages: list[dict]) -> Optional[str]:
         """会话里最后一条用户消息的文本（与 prompt_text 发出的提示词比对）；没有用户消息时为 None。"""
         raise NotImplementedError
+
+    def last_prompt_key(self, messages: list[dict]) -> Optional[str]:
+        """会话里最后一条用户消息的身份，与翻译器记下的 prompt_key 同一口径；不支持按身份绑定的引擎为 None。"""
+        return None
 
     def render_files(self, ctx: FilesContext) -> dict[str, bytes]:
         """写进沙箱的配置文件（不含 egress.json，它与引擎无关）：{路径: 内容}。"""

@@ -95,6 +95,10 @@ tasks = Table(
     Column("abort_requested", Integer, nullable=False, default=0),
     # 引擎返回的运行 ID（pi）：接管后据此确认这次运行是否还在
     Column("run_id", String(64)),
+    # 按会话下发中止前占住会话到这个时刻（R3-01）：期间同一会话不准入新任务，迟到的中止命令不会落到后来的任务上
+    Column("abort_fence_until", Float),
+    # 本轮用户消息的身份（pi：这次运行的用户消息时间戳，runner 从带 runID 的事件记下）：断线重连据此确认快照属于本任务
+    Column("prompt_key", String(64)),
     Index("ix_tasks_pool_agent_created", "pool", "agent_id", "created_at"),
     Index("ix_tasks_pool_state", "pool", "state"),
 )

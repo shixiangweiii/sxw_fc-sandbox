@@ -22,7 +22,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `…业务接入使用手册.md`、`…测试报告.md`；
 - `代码评审/2026-09-26-opencode常驻agent子系统代码评审报告.md`：评审问题（AG-*）、取舍与修复记录；
 - `代码评审/2026-09-26-pi引擎接入代码评审报告.md`：pi 引擎接入的评审（PI-*），含桥接进程的后续项（下次重建模板时处理）；
-- `代码评审/2026-09-27-opencode进程池与pi集成-最近三次提交代码评审报告.md`：最近三次提交的评审（R3-*），第六节是二次复核、修复与遗留项。
+- `代码评审/2026-09-27-opencode进程池与pi集成-最近三次提交代码评审报告.md`：最近三次提交的评审（R3-*），第六节是二次复核、修复与遗留项；
+- `代码评审/2026-09-27-9f265ba修复二次复核与真实云沙箱验证报告.md`：R3 修复的验收（含真实云沙箱探针），第三节是 R3-01 / R3-04 的两个残留，第六节是它们的修复记录。
 
 ## 常用命令
 
@@ -125,9 +126,14 @@ DEEPSEEK_API_KEY=... python scripts/pi_bridge_local_check.py --pi <pi 的 dist/b
 - **任务执行**：
   - 任务由后台 `TaskRunner` 执行，HTTP 响应只读订阅队列；客户端断开不取消 runner，也不在数据库操作中途取消；
   - runner 刷新 `tasks.op_deadline` 作为心跳，过期后其他副本 CAS 接管（`resume=True`）；
-  - **中止按会话生效**（两种引擎都没有按运行中止的接口）：`abort_task` 只写 `abort_requested`，中止命令只由跟进任务的 runner 下发，下发前读库确认仍持有任务（RUNNING 且 `op_owner` 是自己）。任务在库里 RUNNING 期间同一会话不会准入新任务，这是命令不落到后来任务上的前提；不要在别处按会话调用 abort（R3-01）。runner 每秒读一次库（`_DB_POLL_S`）；
-  - **跨副本断线重连**（`_follow_remote`）要按轮次划清归属，事件和消息都只按会话区分：快照只在会话正忙（pi 还要 run_id 一致）且最后一条用户消息是本任务的提示词时补发；订阅建立时、翻译器报告新一轮开始（`round_starts`）时立即读库，本轮结束（idle / agent_settled）后不再转发（R3-04）。重连时正在输出的消息错过了开头，以全文为准：opencode 的增量不落盘（快照里没有进行中的文本），缓存的增量不是部件全文的开头就丢弃、按结束时的全文输出；pi 的 `message_update` 不带累积内容，翻译器 `mid_round` 时没看到 `message_start` 的消息等 `message_end` 整条输出（R3-N1）。
-- **任务准入**（`AgentStore.create_task`，池级锁内）：同一事务里检查沙箱仍在服务、会话不忙、未超并发上限、沙箱不在重载配置，插入任务并记录沙箱活动时间、把版本号加一。版本号加一使维护循环按旧快照做的空闲销毁或轮换 CAS 失败，不会销毁刚接了新任务的沙箱；`touch_sandbox` 在任务结束时做同样的事。
+  - **中止按会话生效**（两种引擎都没有按运行中止的接口）：`abort_task` 只写 `abort_requested`，中止命令只由跟进任务的 runner 下发，不要在别处按会话调用 abort（R3-01）。确认持有任务之后命令仍可能停在路上：旧 runner 停顿、心跳过期被接管、任务结束、同一会话开始下一个任务，迟到的命令就中止了它（验收报告 3.1）。所以：
+    - 下发前用 `begin_abort` 在库里占住会话（`tasks.abort_fence_until`，CAS 要求仍持有任务）；`create_task` 对有未到期占用的会话返回 aborting，请求路径等待；
+    - 下发用 `wait_for` 限时 `_ABORT_TIMEOUT_S`，短于占用 `_ABORT_HOLD_S`（与重载配置的 60s / 90s 同理）；没送达的隔 `_ABORT_RETRY_S` 重试；
+    - 送达且占用是独占的才 `end_abort` 提前释放（正常路径不拖慢下一条消息）；接管方遇到前任未到期的占用，不释放、等它到期；
+    - 剩下的只有进程恰好在写出请求的同步路径上被整体冻结超过两者之差；彻底消除要引擎按运行校验中止（pi 桥接进程可在重建模板时加）。
+    runner 每秒读一次库（`_DB_POLL_S`）；
+  - **跨副本断线重连**（`_follow_remote`）要按轮次划清归属，事件和消息都只按会话区分：快照只在会话正忙（pi 还要 run_id 一致）且最后一条用户消息是本任务那一条时补发，**取消息之后再读一次库**、任务仍 RUNNING 才发（取消息期间会话可能换轮，验收报告 3.2）；订阅建立时、翻译器报告新一轮开始（`round_starts`）时立即读库，本轮结束（idle / agent_settled）后不再转发（R3-04）。「本任务那一条」：opencode 先写用户消息再置忙，比对提示词文本即可；pi 回复受理之后要经过几次 await 才写入用户消息，要按身份绑定——runner 从带同一 runID 的用户消息 `message_end` 记下时间戳（`tasks.prompt_key`）。opencode 不按事件绑定身份：`summarize` 在后台补写旧用户消息、会再发一次 `message.updated`。重连时正在输出的消息错过了开头，以全文为准：opencode 的增量不落盘（快照里没有进行中的文本），缓存的增量不是部件全文的开头就丢弃、按结束时的全文输出；pi 的 `message_update` 不带累积内容，翻译器 `mid_round` 时没看到 `message_start` 的消息等 `message_end` 整条输出（R3-N1）。
+- **任务准入**（`AgentStore.create_task`，池级锁内）：同一事务里检查沙箱仍在服务、会话不忙、会话没有未到期的中止占用、未超并发上限、沙箱不在重载配置，插入任务并记录沙箱活动时间、把版本号加一。版本号加一使维护循环按旧快照做的空闲销毁或轮换 CAS 失败，不会销毁刚接了新任务的沙箱；`touch_sandbox` 在任务结束时做同样的事。
 - **修改设置**用 `AgentStore.patch_settings`：池级锁内读最新设置、合并、写回并把版本号加一，不要按请求读到的 agent 快照整包覆盖（并发修改不同字段会互相丢失，R3-03）。
 - **重载配置**（设置变更后的 `POST /instance/dispose`）：opencode 会中止沙箱里所有运行中的会话（pi 桥接进程只重启空闲会话进程），必须与任务准入互斥：`begin_reload` 在池级锁内确认没有运行中任务，再占住 ACTIVE 行的 `op_owner` / `op_deadline`（在服务的沙箱只有这时这两列非空），期间 `create_task` 返回 reloading、请求路径等待；重载整体限时且短于占用时长。
 - **出网**：
@@ -140,7 +146,7 @@ DEEPSEEK_API_KEY=... python scripts/pi_bridge_local_check.py --pi <pi 的 dist/b
   - 建连失败一律重试，非幂等 POST 读失败不重试；
   - 维护循环只用 HTTP 探测 `/global/health`，不调用 `connect()`。
 - **接口输出**：`access_token`（流量令牌）与 `lease_id` 一样是凭证，任何接口都不返回（`sandbox_view`、管理员列表都要去掉）。
-- **测试**：`provider/fake_opencode.py` 是内存版 opencode，提示词里的 `[sleep:秒]`、`[tool]`、`[error]`、`[ask]`、`[remember]`、`[partial]`（运行中途先产出一段文本）等指令模拟不同行为；它与真实行为一致的两点不要去掉：客户端 close 后再调用报错、dispose 取消运行中的会话。`make_agents` 夹具可建多个副本（各自打开 store，模拟多进程）；生产中 `create_app` 让 agent 子系统共用代码执行池的数据库引擎（每进程一个 SQLite 写连接）。`tests/test_agent_review_fixes.py` 按评审编号（AG-*）组织。`provider/fake_pi.py` 是内存版 pi 桥接进程（另有 `[crash]` 指令），保留的真实语义：重载不中止运行中的会话、进程丢失后 run 为 lost、`restart()` 后旧 run 为 unknown、`/mcp` 等扩展命令不产生运行且会话一直忙（pi 0.87.1）、每条消息 `message_start` → 增量 → `message_end`（带全文）；`FakeProvider.pi_templates` 里的模板建出 pi 沙箱。`tests/test_agent_pi.py` 末尾按评审编号（PI-*）组织；`tests/test_agent_r3_fixes.py` 按 R3-* 组织，并发用例对两种引擎参数化，用事件门控固定时序。
+- **测试**：`provider/fake_opencode.py` 是内存版 opencode，提示词里的 `[sleep:秒]`、`[tool]`、`[error]`、`[ask]`、`[remember]`、`[partial]`（运行中途先产出一段文本）、`[round]`（回复带上是会话里的第几轮，相同提示词也能分出轮次）等指令模拟不同行为；它与真实行为一致的两点不要去掉：客户端 close 后再调用报错、dispose 取消运行中的会话。`make_agents` 夹具可建多个副本（各自打开 store，模拟多进程）；生产中 `create_app` 让 agent 子系统共用代码执行池的数据库引擎（每进程一个 SQLite 写连接）。`tests/test_agent_review_fixes.py` 按评审编号（AG-*）组织。`provider/fake_pi.py` 是内存版 pi 桥接进程（另有 `[crash]` 指令），保留的真实语义：重载不中止运行中的会话、进程丢失后 run 为 lost、`restart()` 后旧 run 为 unknown、`/mcp` 等扩展命令不产生运行且会话一直忙（pi 0.87.1）、每条消息 `message_start` → 增量 → `message_end`（带全文）；`FakeProvider.pi_templates` 里的模板建出 pi 沙箱。`tests/test_agent_pi.py` 末尾按评审编号（PI-*）组织；`tests/test_agent_r3_fixes.py` 按 R3-* 组织，并发用例对两种引擎参数化，用事件门控固定时序。
 
 **鉴权**（`api/auth.py`）：
 - `POOL_API_KEYS` / `POOL_ADMIN_KEYS`，格式「名称:key」，逗号分隔。两者都为空时关闭鉴权，此时进程拒绝监听非回环地址（除非 `--allow-no-auth`）。

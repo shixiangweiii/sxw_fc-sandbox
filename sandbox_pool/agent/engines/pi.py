@@ -47,6 +47,9 @@ class PiTranslator:
         self.asks: list[tuple[str, str]] = []
         self.round_starts = 0
         self.mid_round = False
+        # runner 设置本轮的 run_id；带同一 runID 的用户消息 message_end 的时间戳即本轮用户消息的身份
+        self.run_id: Optional[str] = None
+        self.prompt_key: Optional[str] = None
         self.tool_args: dict[str, object] = {}
         # 当前 assistant 消息：看到了它的 message_start / 增量没有转发（缺开头，等 message_end）
         self._msg_open = False
@@ -86,7 +89,11 @@ class PiTranslator:
                 out.append(("reasoning", {"delta": ame["delta"]}))
         elif t == "message_end":
             m = e.get("message") or {}
-            if m.get("role") == "assistant":
+            if m.get("role") == "user":
+                if (self.prompt_key is None and self.run_id and props.get("runID") == self.run_id
+                        and m.get("timestamp") is not None):
+                    self.prompt_key = str(m["timestamp"])
+            elif m.get("role") == "assistant":
                 if self._msg_held:
                     content = m.get("content")
                     thinking = "".join(c.get("thinking") or "" for c in content or []
@@ -162,6 +169,14 @@ def last_prompt(messages: list[dict]) -> Optional[str]:
     return None
 
 
+def last_prompt_key(messages: list[dict]) -> Optional[str]:
+    """最后一条用户消息的时间戳（pi 的消息没有 ID；同一会话的提示词串行准入，两条用户消息不会同毫秒）。"""
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            return None if m.get("timestamp") is None else str(m["timestamp"])
+    return None
+
+
 def mcp_servers(mcp: dict) -> dict:
     """网关的 MCP 配置（opencode 格式，policy.validate_mcp）→ pi-mcp-adapter 的 mcpServers。
 
@@ -209,6 +224,9 @@ class PiEngine(Engine):
 
     def last_prompt(self, messages: list[dict]) -> Optional[str]:
         return last_prompt(messages)
+
+    def last_prompt_key(self, messages: list[dict]) -> Optional[str]:
+        return last_prompt_key(messages)
 
     def render_files(self, ctx: FilesContext) -> dict[str, bytes]:
         servers = mcp_servers(ctx.mcp)

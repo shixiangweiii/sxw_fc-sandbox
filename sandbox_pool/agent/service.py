@@ -676,11 +676,15 @@ class AgentService:
                 op_deadline=now + self.cfg.agent_task_takeover_s,
             )
             status, created = await self.store.create_task(task, max_running=self.cfg.agent_max_running_tasks)
-            if status != "reloading":
+            if status not in ("reloading", "aborting"):
                 break
-            # 维护循环正在重载该沙箱的配置（dispose 会中止运行中的会话），通常 1~2 秒
+            # reloading：维护循环正在重载该沙箱的配置（dispose 会中止运行中的会话），通常 1~2 秒；
+            # aborting：同一会话上一个任务的中止命令可能还在路上（中止它的副本被接管过），等占用到期（R3-01）
             if time.monotonic() >= wait_until:
-                raise WaitTimeout("agent sandbox is still reloading its configuration, retry later")
+                raise WaitTimeout(
+                    "agent sandbox is still reloading its configuration, retry later" if status == "reloading"
+                    else f"session {session_id} is still finishing the abort of its previous task, retry later"
+                )
             await asyncio.sleep(_RELOAD_POLL_S)
         if status == "gone":
             raise _SandboxGone()
@@ -818,23 +822,36 @@ class AgentService:
             out.put_nowait(None)
 
     async def _attach_snapshot(self, client, engine: Engine, task: dict) -> str:
-        """重连时补发的本轮已有文本。只在确认会话正在运行这个任务那一轮时补发，否则为空（R3-04）：
+        """重连时补发的本轮已有文本。只在确认取到的消息里最后一轮正是这个任务那一轮时补发，否则为空（R3-04）：
 
         - 会话不忙：这一轮还没开始（提示词未送达，会话里最后一轮是上一个任务的；连续两轮提示词相同时比对文本也分不出），
-          或者已经结束（done 随后就到，带最终结果）；
-        - 支持 run_id 的引擎（pi）：正在运行的必须是这个任务的 run；
-        - 最后一条用户消息必须是这个任务的提示词（pi 桥接进程受理提示词时就记为忙，用户消息稍后才写入会话）。
+          或者已经结束（done 随后就到，带最终结果）。opencode 先写用户消息再置忙，所以忙就说明本轮用户消息已在会话里；
+        - 支持 run_id 的引擎（pi）：正在运行的必须是这个任务的 run；而且桥接进程受理提示词时就记为忙，pi 回复受理之后
+          还要经过几次 await 才把用户消息写进会话，这期间最后一条用户消息仍是上一轮的。所以按身份绑定：最后一条用户
+          消息必须是 runner 从带同一 runID 的事件记下的那条（prompt_key），不能只比对提示词文本；
+        - 其他引擎：最后一条用户消息必须是这个任务的提示词；
+        - 取消息期间会话可能已换到下一轮（验收报告 3.2）：取到消息之后任务在库里仍是 RUNNING，才能说明其中没有后面
+          任务的轮次——后面的任务要等本任务结束才准入，它的提示词要等准入之后才发出。
         """
         sid = task["session_id"]
         busy = (await client.status()).get(sid)
         if not busy:
             return ""
-        if engine.has_runs:
-            fresh = await self.store.get_task(task["id"])
-            if fresh is None or not fresh["run_id"] or busy.get("run_id") != fresh["run_id"]:
-                return ""
+        fresh = await self.store.get_task(task["id"])
+        if fresh is None or fresh["state"] != TaskState.RUNNING.value:
+            return ""
+        if engine.has_runs and (
+            not fresh["run_id"] or busy.get("run_id") != fresh["run_id"] or not fresh["prompt_key"]
+        ):
+            return ""
         messages = await client.messages(sid)
-        if engine.last_prompt(messages) != engine.prompt_text(task["prompt"]):
+        if engine.has_runs:
+            if engine.last_prompt_key(messages) != fresh["prompt_key"]:
+                return ""
+        elif engine.last_prompt(messages) != engine.prompt_text(task["prompt"]):
+            return ""
+        after = await self.store.get_task(task["id"])
+        if after is None or after["state"] != TaskState.RUNNING.value:
             return ""
         return engine.extract_result(messages)[0]
 
@@ -842,9 +859,9 @@ class AgentService:
         """中止运行中的任务：只在库里记中止标记，中止命令由跟进该任务的 runner 下发（R3-01）。
 
         引擎的中止按会话生效（opencode、pi 桥接进程都没有按运行中止的接口），这里直接下发的话，命令可能在任务结束、
-        同一会话开始下一个任务之后才到，中止掉别的任务。runner 下发前确认自己仍持有任务：任务在库里 RUNNING 期间，
-        同一会话不会准入新任务（create_task 的 session_busy）。本副本的 runner 立即处理，其他副本的 runner 每秒查一次库，
-        负责副本崩溃时由接管的副本下发。
+        同一会话开始下一个任务之后才到，中止掉别的任务。runner 下发前在库里占住会话、限时下发（见 TaskRunner._check_abort），
+        占用期间同一会话不准入新任务。本副本的 runner 立即处理，其他副本的 runner 每秒查一次库，负责副本崩溃时由接管的
+        副本下发。
         """
         task = await self.get_task(agent, task_id)
         if task["state"] != TaskState.RUNNING.value:

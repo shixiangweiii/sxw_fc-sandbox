@@ -43,6 +43,10 @@ class Translator:
         self.asks: list[tuple[str, str]] = []  # (permission | question, request id)
         self.round_starts = 0
         self.mid_round = False
+        # opencode 的事件不带运行标识，而且 summarize 在后台补写旧用户消息（再发一次 message.updated），不按事件绑定身份；
+        # 断线重连靠「会话正忙时本轮用户消息已写入」与取消息后再读库（见 service._attach_snapshot）
+        self.run_id: Optional[str] = None
+        self.prompt_key: Optional[str] = None
 
     def _emit_text(self, part_id: str, kind: str, delta: str, out: list) -> None:
         if not delta:

@@ -200,7 +200,7 @@ data: {"task_id": "b136…", "state": "SUCCEEDED", "result": "系统架构是 x8
 | GET | `/v1/agents/{user_id}/tasks` | 列表，按创建时间倒序。参数：`source`（message / schedule）、`schedule_id`、`state`、`since`（epoch 秒）、`limit`（≤500） |
 | GET | `/v1/agents/{user_id}/tasks/{task_id}` | 详情 |
 | GET | `/v1/agents/{user_id}/tasks/{task_id}/stream` | 断线重连（SSE）。任务仍在运行：先补发本轮已有的回复文本，再接实时事件直到 `done`；重连时正在输出的那条消息，等它输出完整条补发。只包含这个任务那一轮的输出，不会混入同一会话前后任务的内容。已结束：直接返回 `done`。可以连任意副本 |
-| POST | `/v1/agents/{user_id}/tasks/{task_id}/abort` | 中止运行中的任务（已结束返回 409）。异步生效：返回时任务通常仍是 `RUNNING`，约 1 秒内结束为 `ABORTED`；负责该任务的副本崩溃时，等其他副本接管后生效。只影响这个任务，不会中止同一会话之后的任务 |
+| POST | `/v1/agents/{user_id}/tasks/{task_id}/abort` | 中止运行中的任务（已结束返回 409）。异步生效：返回时任务通常仍是 `RUNNING`，约 1 秒内结束为 `ABORTED`；负责该任务的副本崩溃时，等其他副本接管后生效。只影响这个任务，不会中止同一会话之后的任务；为此，如果负责中止的副本中途停顿、被接管过，同一会话的下一条消息会先等待（最多约 45 秒）再开始 |
 
 任务 JSON：
 

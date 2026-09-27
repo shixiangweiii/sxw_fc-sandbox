@@ -44,11 +44,13 @@
     - 响应只有 `{"success": true}`，不带新版文档里的 `disposition`；
     - 以 `/` 开头、命中扩展命令（pi-mcp-adapter 注册的 `/mcp`、`/pi-mcp`、`/mcp-auth`）的文本会被当命令执行，不产生运行、没有 `agent_settled`，桥接进程 0.1.2 因此把会话永久记为忙。网关在这类文本前加空格转义；
     - 响应要等 preflight 完成，其中包括上一轮被中止时的上下文压缩（调一次模型），可能远超 30s。见 `sxw_aicoding/代码评审/2026-09-26-pi引擎接入代码评审报告.md`。
-  - **pi 0.87.1 的事件与消息（本机实测，2026-09-27 R3 评审修复）**：每条消息 `message_start` → （assistant）`message_update` 增量 → `message_end`（带全文），一次运行一个 `agent_start`；RPC 的 `message_update` **不带累积内容**（`dist/modes/json-event.d.ts`），错过 `message_start` 的一方拼不出开头，只能等 `message_end`。`get_messages` 不含正在输出的消息。用户消息存为 `{role: user, content: [{type: text, text}]}`，文本与发送的一致（只有以 `/` 开头的会被展开）。桥接进程 `/session/status` 的忙碌项带当前 `run_id`。
+  - **pi 0.87.1 的事件与消息（本机实测，2026-09-27 R3 评审修复）**：每条消息 `message_start` → （assistant）`message_update` 增量 → `message_end`（带全文），一次运行一个 `agent_start`；RPC 的 `message_update` **不带累积内容**（`dist/modes/json-event.d.ts`），错过 `message_start` 的一方拼不出开头，只能等 `message_end`。`get_messages` 不含正在输出的消息。用户消息存为 `{role: user, content: [{type: text, text}]}`，文本与发送的一致（只有以 `/` 开头的会被展开）。桥接进程 `/session/status` 的忙碌项带当前 `run_id`。**回复受理（preflight 结束）之后，还要经过几次 `await emit(...)`（`agent_start`、`turn_start`、`message_start`，含扩展钩子）才把用户消息写进会话**（pi-agent-core `runAgentLoop`）：这期间 `get_messages` 的最后一条用户消息仍是上一轮的（2026-09-28 验收残留修复）。
 - **opencode 1.18.32 的事件与消息（本机实测 + 源码，2026-09-27 R3 评审修复）**：
   - `prompt_async` 先返回 204，再异步创建用户消息（`message.updated` 用户 → 用户部件 → `session.status busy`）：刚返回时会话里最后一轮仍是上一轮；
   - 文本 / 思考部件：开始时 `message.part.updated`（空文本）→ `message.part.delta` 增量 → 结束时 `message.part.updated`（全文）。**增量不落盘**：输出期间 `GET /session/{id}/message` 里这个部件是空文本；
   - 一轮里同一条用户消息会再收到一次 `message.updated`（摘要）；出错结束时 `session.status idle` 连发两次；压缩、子任务总结时 opencode 会自己插入用户消息；
+  - 摘要（`SessionSummary.summarize`）是 fork 出去后台跑的，算完 diff 再对用户消息 `updateMessage`：旧一轮用户消息的 `message.updated` 可能在下一轮开始之后才到，不能拿「订阅后看到的第一条用户消息」当本轮的身份；
+  - 用户消息先写入、再置忙（`createUserMessage` 在 `loop` 设 busy 之前），所以会话忙就说明本轮用户消息已在会话里；
   - 中止只有按会话的 `POST /session/{id}/abort`（pi 桥接进程同样），没有按运行中止的接口。见 `sxw_aicoding/代码评审/2026-09-27-opencode进程池与pi集成-最近三次提交代码评审报告.md` 第六节。
 - **第二代 code-interpreter 镜像环境**：
   - 默认用户 user（sudo 组），x86_64，Debian 13，PID 1 为 systemd；

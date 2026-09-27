@@ -8,8 +8,9 @@
   只跟进到结束并落库。
 - 完成判定以事件为主（opencode：session.status 从 busy 回到 idle；pi：agent_settled），同时定期轮询 /session/status 兜底
   （事件流断开、重连期间）。
-- 中止（用户请求、超过最长执行时间）按会话生效，只由 runner 在确认仍持有任务之后下发：任务在库里 RUNNING 期间同一会话
-  不会准入新任务，命令不会落到后来的任务上（R3-01）。其他副本收到的中止请求只写库，runner 每秒读库查到。
+- 中止（用户请求、超过最长执行时间）按会话生效，只由持有任务的 runner 下发；其他副本收到的中止请求只写库，runner 每秒
+  读库查到。下发前在库里占住会话（期间同一会话不准入新任务），下发整体限时、短于占用：停顿的旧 runner 被接管之后，
+  迟到的命令也落不到后来的任务上（R3-01，见 _check_abort）。
 - 支持 run_id 的引擎（pi）：跟进结束后确认这次运行还在；沙箱内进程重启过（run 丢失）就记为失败，不把残缺结果当成功。
 """
 
@@ -33,6 +34,11 @@ _MERGEABLE = ("text", "reasoning")
 _STATUS_POLL_S = 5.0
 # 多久读一次库：确认仍持有任务、查其他副本收到的中止请求（abort_requested，中止命令只由 runner 下发，见 R3-01）
 _DB_POLL_S = 1.0
+# 按会话下发中止：先占住会话 _ABORT_HOLD_S，下发整体限时 _ABORT_TIMEOUT_S。占用要比限时长出足够余量（含副本之间的
+# 时钟偏差），保证命令不会在占用到期之后才发出（与重载配置的 60s / 90s 同理）；没送达的隔 _ABORT_RETRY_S 再试
+_ABORT_TIMEOUT_S = 20.0
+_ABORT_HOLD_S = 45.0
+_ABORT_RETRY_S = 5.0
 # prompt 之后多久还没见到 busy，就以 /session/status 为准判定完成（防止 busy / idle 事件都丢了的情况）
 _NO_BUSY_GRACE_S = 15.0
 # run 查询结果：这次运行已不存在（沙箱内进程或桥接进程重启过）
@@ -72,7 +78,11 @@ class TaskRunner:
         self.final: Optional[dict] = None
         self._abort = asyncio.Event()
         self._stop = asyncio.Event()
+        # 已决定中止的原因（最终状态据此）；中止命令是否已送达、没送达时下次重试的时刻
         self._abort_reason: Optional[TaskState] = None
+        self._abort_sent = False
+        self._abort_retry_at = 0.0
+        self._prompt_key_saved = False
 
     # ---------- 订阅 ----------
 
@@ -218,39 +228,77 @@ class TaskRunner:
     async def _check_abort(self, *, poll_db: bool) -> None:
         """超过最长执行时间或收到中止请求时中止会话。
 
-        截止时间与本副本收到的中止请求每轮都查（不涉及 IO）；其他副本收到的中止请求只写库，poll_db 时读库查到。
-        中止按会话生效，下发前读库确认本副本仍持有任务（RUNNING 且负责副本是自己）：这期间同一会话不会准入新任务，
-        中止只会落在这个任务上（R3-01）。
+        截止时间与本副本收到的中止请求每轮都查（不涉及 IO）；其他副本收到的中止请求只写库，poll_db 时读库查到，
+        同时确认仍持有任务。
+
+        引擎的中止只按会话生效。确认持有任务之后，命令仍可能停在路上（网络、事件循环、进程停顿），期间本副本心跳过期、
+        任务被接管并结束、同一会话开始了下一个任务，迟到的命令就会中止它（验收报告 3.1）。所以：
+        - 下发前在库里占住会话（begin_abort，要求仍持有任务），占用期间 create_task 对同一会话返回 aborting；
+        - 下发整体限时，短于占用：停在 await 上的迟到命令在占用到期之前就被取消；
+        - 送达且占用是独占的才提前释放；接管前的负责副本还有占用时，接管方不释放，等它到期（R3-01）。
+        剩下的只有进程恰好在写出请求的同步路径上被整体冻结、超过占用与限时之差这一种情况；彻底消除要引擎按运行校验
+        中止（opencode 没有这样的接口，pi 桥接进程可在重建模板时加）。
         """
-        if self._abort_reason is not None:
+        if self._abort_sent:
             return
-        reason = None
-        if self.svc.now() >= self.task["deadline"]:
-            reason = TaskState.TIMEOUT
-        elif self._abort.is_set():
-            reason = TaskState.ABORTED
-        if reason is None and not poll_db:
-            return
-        try:
-            fresh = await self.svc.store.get_task(self.task_id)
-        except Exception:  # noqa: BLE001 - 数据库抖动时下一轮再查
-            log.warning("task %s: reading task failed", self.task_id, exc_info=True)
-            return
-        if fresh is None or fresh["state"] != TaskState.RUNNING.value or fresh["op_owner"] != self.svc.replica_id:
-            raise _LostOwnership()
-        if reason is None:
-            if not fresh["abort_requested"]:
+        if self._abort_reason is None:
+            reason = None
+            if self.svc.now() >= self.task["deadline"]:
+                reason = TaskState.TIMEOUT
+            elif self._abort.is_set():
+                reason = TaskState.ABORTED
+            elif poll_db:
+                try:
+                    fresh = await self.svc.store.get_task(self.task_id)
+                except Exception:  # noqa: BLE001 - 数据库抖动时下一轮再查
+                    log.warning("task %s: reading task failed", self.task_id, exc_info=True)
+                    return
+                if fresh is None or fresh["state"] != TaskState.RUNNING.value or fresh["op_owner"] != self.svc.replica_id:
+                    raise _LostOwnership()
+                if fresh["abort_requested"]:
+                    reason = TaskState.ABORTED
+            if reason is None:
                 return
-            reason = TaskState.ABORTED
-        self._abort_reason = reason
-        log.info("task %s: aborting (%s)", self.task_id, reason.value)
+            self._abort_reason = reason
+            log.info("task %s: aborting (%s)", self.task_id, reason.value)
+        elif time.monotonic() < self._abort_retry_at:
+            return
+        now = self.svc.now()
+        until = now + _ABORT_HOLD_S
         try:
-            await self.client.abort(self.session_id)
-        except Exception as e:  # noqa: BLE001 - 以之后的状态轮询为准
-            log.warning("task %s: abort failed: %r", self.task_id, e)
+            exclusive = await self.svc.store.begin_abort(self.task_id, owner=self.svc.replica_id, now=now, until=until)
+        except Exception:  # noqa: BLE001 - 数据库抖动时下一轮再试
+            log.warning("task %s: reserving the session for abort failed", self.task_id, exc_info=True)
+            return
+        if exclusive is None:
+            raise _LostOwnership()
+        try:
+            await asyncio.wait_for(self.client.abort(self.session_id), timeout=_ABORT_TIMEOUT_S)
+        except Exception as e:  # noqa: BLE001 - 占用到期前不释放（命令可能还在路上），过一会儿再试
+            log.warning("task %s: abort failed, will retry: %r", self.task_id, e)
+            self._abort_retry_at = time.monotonic() + _ABORT_RETRY_S
+            return
+        self._abort_sent = True
+        if exclusive:
+            try:
+                await self.svc.store.end_abort(self.task_id, until=until)
+            except Exception:  # noqa: BLE001 - 到期自然失效
+                log.warning("task %s: releasing the abort reservation failed", self.task_id, exc_info=True)
+
+    async def _save_prompt_key(self, key: str) -> None:
+        """记下本轮用户消息的身份（pi），断线重连据此确认快照属于本任务（验收报告 3.2）。"""
+        self._prompt_key_saved = True
+        try:
+            await self.svc.store.cas_task(
+                self.task_id, [TaskState.RUNNING], expect_owner=self.svc.replica_id, prompt_key=key
+            )
+        except Exception:  # noqa: BLE001 - 记不下来只是断线重连时不补发快照
+            log.warning("task %s: saving the prompt key failed", self.task_id, exc_info=True)
 
     async def _follow(self, queue: asyncio.Queue, reader: asyncio.Task) -> Optional[tuple]:
         tr = self.engine.translator(self.session_id)
+        # 支持 run_id 的引擎（pi）：翻译器据此从带同一 runID 的事件认出本轮的用户消息（prompt_key）
+        tr.run_id = self.run_id
         started = time.monotonic()
         next_poll = started + _STATUS_POLL_S
         next_db = started + _DB_POLL_S
@@ -270,6 +318,8 @@ class TaskRunner:
             if ev is not None:
                 for kind, data in tr.feed(ev):
                     self._publish(kind, data)
+                if tr.prompt_key and not self._prompt_key_saved:
+                    await self._save_prompt_key(tr.prompt_key)
                 while tr.asks:
                     await self._auto_reject(*tr.asks.pop(0))
                 if tr.idle:

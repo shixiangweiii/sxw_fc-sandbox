@@ -261,7 +261,9 @@ class AgentStore(Store):
         """任务准入，与重载沙箱配置（begin_reload）用同一把池级锁互斥。依次检查：
 
         - 沙箱不在服务（ACTIVE / RETIRING）→ ("gone", None)；
-        - 指定的会话有运行中的任务 → ("session_busy", None)；该 agent 运行中任务数 >= max_running → ("too_many", None)；
+        - 指定的会话有运行中的任务 → ("session_busy", None)；
+        - 指定的会话有未到期的中止占用（begin_abort，前一个任务的中止命令可能还在路上）→ ("aborting", None)，调用方稍后重试；
+        - 该 agent 运行中任务数 >= max_running → ("too_many", None)；
         - 沙箱正在重载配置（op_owner 未过期）→ ("reloading", None)，调用方稍后重试；
         - 否则插入任务，同一事务内记录沙箱活动时间并把版本号加一：维护循环按旧快照做的空闲销毁 / 轮换 CAS 会失败，
           不会销毁刚接了新任务的沙箱。返回 ("ok", 任务)。
@@ -290,6 +292,22 @@ class AgentStore(Store):
                 ).scalar_one()
                 if busy:
                     return "session_busy", None
+                fenced = (
+                    await conn.execute(
+                        select(func.count())
+                        .select_from(tasks)
+                        .where(
+                            and_(
+                                tasks.c.pool == self.pool,
+                                tasks.c.agent_id == task["agent_id"],
+                                tasks.c.session_id == task["session_id"],
+                                tasks.c.abort_fence_until > now,
+                            )
+                        )
+                    )
+                ).scalar_one()
+                if fenced:
+                    return "aborting", None
             n = (await conn.execute(select(func.count()).select_from(tasks).where(running))).scalar_one()
             if n >= max_running:
                 return "too_many", None
@@ -309,6 +327,39 @@ class AgentStore(Store):
                 )
             )
             return "ok", _task_row(row)
+
+        return await self._retry(fn)
+
+    async def begin_abort(self, task_id: str, *, owner: str, now: float, until: float) -> Optional[bool]:
+        """按会话下发中止之前占住会话到 until（R3-01）：要求本副本仍持有任务（RUNNING 且 op_owner 是自己）。
+
+        引擎的中止只按会话生效，命令可能在发出方停顿、任务被接管结束之后才送达；占用期间 create_task 对同一会话返回
+        aborting，下发方在占用到期之前放弃下发（限时），迟到的命令就不会落到后来的任务上。
+        返回 None：已不再持有任务；否则返回是否独占——占用前没有别人未到期的占用（接管前的负责副本可能还有命令在路上）。
+        """
+
+        async def fn(conn):
+            held = and_(tasks.c.id == task_id, tasks.c.state == TaskState.RUNNING.value, tasks.c.op_owner == owner)
+            r = (await conn.execute(select(tasks.c.abort_fence_until).where(held))).first()
+            if r is None:
+                return None
+            res = await conn.execute(update(tasks).where(held).values(abort_fence_until=until))
+            if res.rowcount != 1:
+                return None
+            return r.abort_fence_until is None or r.abort_fence_until <= now
+
+        return await self._retry(fn)
+
+    async def end_abort(self, task_id: str, *, until: float) -> bool:
+        """中止已送达、且占用是本次独占的：提前释放（只释放自己设的那次，被别人延长过就不动）。"""
+
+        async def fn(conn):
+            res = await conn.execute(
+                update(tasks)
+                .where(and_(tasks.c.id == task_id, tasks.c.abort_fence_until == until))
+                .values(abort_fence_until=None)
+            )
+            return res.rowcount == 1
 
         return await self._retry(fn)
 

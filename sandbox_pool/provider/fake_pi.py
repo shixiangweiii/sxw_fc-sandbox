@@ -16,7 +16,8 @@
 
 提示词指令（可组合）：[sleep:秒]、[tool]、[error]、[reasoning]、[retry]、[remember]、[crash]（进程崩溃）、
 [ui]（扩展对话框请求，桥接进程自动应答）、[partial]（[sleep] 之前先完成一条文本为 "PARTIAL " 的 assistant 消息，
-验证运行中途重连的补发）。其余回复 "echo: <提示词>"。
+验证运行中途重连的补发）、[round]（回复末尾加上这是会话里的第几轮，提示词相同的两轮也能分出回复属于哪一轮）。
+其余回复 "echo: <提示词>"。
 """
 
 import asyncio
@@ -211,6 +212,8 @@ class FakePiServer:
                     reply = f"remembered: {prev['content'] if prev else '(nothing)'}"
                 else:
                     reply = f"echo: {text}"
+                if "[round]" in text:
+                    reply += f" #{sum(1 for m in s['messages'] if m['role'] == 'user')}"
                 open_reply()
                 await self._stream(sid, "text_delta", reply)
                 content.append({"type": "text", "text": reply})
