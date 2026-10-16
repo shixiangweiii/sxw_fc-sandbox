@@ -100,8 +100,16 @@
 归还时的销毁会被拒、沙箱卡在 DESTROYING 并继续占容量，直到平台状态机走完。
 处置是这类用法关掉暂停（`POOL_PAUSE_ENABLED=false`）—— 归还即销毁本来就不从暂停里获益。
 
-**基础镜像带的 Python 包比文档说的多**：除 numpy / pandas / matplotlib 外，
-实测 `scipy`（1.18.1）与 `jinja2` 也在。所以「要不要预装」得按实际 import 试，不能照文档猜。
+**基础镜像带的 Python 包比文档说的多 —— 实测 105 个**（`pip list` 全量枚举）：
+除 numpy / pandas / matplotlib 外，还有 scipy、scikit-learn、seaborn、plotly、bokeh、
+opencv-python、numba、librosa、soundfile、nltk、spacy、requests、httpx、pillow、PyYAML、
+python-dateutil、Jinja2、rich、typer、tqdm、pydantic 等。
+所以「要不要预装」得按实际 import 试，不能照文档猜 —— 预装一个本来就有的包是白费。
+
+**预装模板是确定的**（`scripts/probe_template_determinism.py`，6 次）：
+6/6 台沙箱里 6 个新增包（openpyxl / bs4 / lxml / pypdf / tabulate / python-docx）全部在位，
+基线包也每台都齐。⚠️ 量这件事时注意：`set -a; . ./.env` 会把 `POOL_TEMPLATE` 设回基线模板，
+而每个 shell 调用都是新进程 —— 我在这上面栽过一次，把基线模板当成预装模板扫了半天。
 
 **预装依赖的模板**（`scripts/build_pyagent_template.py`，11 个常用 Python 包）：
 | | 预装模板 | 基线模板 |

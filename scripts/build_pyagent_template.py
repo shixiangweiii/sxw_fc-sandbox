@@ -71,7 +71,9 @@ python3 -m pip install $FLAGS __PACKAGES__ > /tmp/pip-build.log 2>&1 || {
   echo "pip install failed:"; tail -40 /tmp/pip-build.log; exit 1;
 }
 python3 -c 'import __IMPORTS__' || { echo "import check failed"; exit 1; }
-python3 -m pip list > /opt/preinstalled-packages.txt 2>/dev/null || true
+# 【定】这里原来有一行 `pip list > /opt/preinstalled-packages.txt || true`，已删。
+# 实测那个文件在沙箱里**不存在** —— `|| true` 把失败吞掉了，于是脚本声称写了一份
+# 清单而盘上没有。没有消费者的声明不如不写（宁可去 `pip list` 现查）。
 # 【定】必须 exec 代码解释器：第二代 PID 1 是 systemd，不会自动拉起它，
 # 不起的话基于本模板建出来的沙箱 run_code 一律 500（create_gen2_template.py 的记录）。
 exec /.fce2b/sandbox-code-interpreter
