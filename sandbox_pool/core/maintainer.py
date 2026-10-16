@@ -291,7 +291,8 @@ class Maintainer:
             return
         limit = min(self.cfg.target_size, self.cfg.max_size)
         # 每轮最多占 limit 个名额：创建失败会很快释放名额，不设上限时同一轮会反复占用、反复创建。
-        # 熔断在占名额的事务内检查，熔断打开后正在进行的补货立即停止
+        # 熔断在占名额的事务内检查，熔断打开后正在进行的补货立即停止。
+        # 补货目标不数销毁中的沙箱，容量上限数（见 reserve_slot）
         for _ in range(limit):
             row = await self.store.reserve_slot(
                 template=self.cfg.template,
@@ -299,6 +300,7 @@ class Maintainer:
                 owner=self.replica_id,
                 op_deadline=self.lc.now() + self.cfg.op_timeout_s,
                 limit=limit,
+                cap=self.cfg.max_size,
             )
             if row is None:
                 return

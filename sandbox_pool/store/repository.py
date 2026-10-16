@@ -138,20 +138,44 @@ class Store:
     # ---------- sandboxes ----------
 
     async def reserve_slot(
-        self, *, template: str, now: float, owner: str, op_deadline: float, limit: int
+        self,
+        *,
+        template: str,
+        now: float,
+        owner: str,
+        op_deadline: float,
+        limit: int,
+        cap: Optional[int] = None,
     ) -> Optional[dict]:
-        """总数 < limit 时插入一条 CREATING 记录占住名额。排空中或创建熔断期间不占。"""
+        """插入一条 CREATING 记录占住名额。排空中或创建熔断期间不占。
+
+        两个数分开数：
+        - ``cap``（容量上限，默认等于 ``limit``）数**所有**记录 —— DESTROYING 的沙箱在云上还活着，
+          照样占配额；
+        - ``limit``（补货目标）**不数 DESTROYING** —— 它已经不可能再借给任何人了。
+
+        合在一起数的后果是实测撞到的：归还时销毁撞上平台的 ``409 PAUSING or RESUMING``，
+        平台状态机比 pause 的 204 滞后了 8.5 分钟，这期间那台沙箱一直「算作库存」，
+        ``target_size=1`` 的池子于是**一台都不补**，下一个借用方白等到 ``wait_timeout_s``。
+        """
+        cap = limit if cap is None else cap
 
         async def fn(conn):
             await self._lock(conn)
             if await self._kv_in_tx(conn, KV_DRAINING) > 0 or await self._kv_in_tx(conn, KV_CREATE_BLOCK_UNTIL) > now:
                 return None
-            total = (
+            in_pool = sandboxes.c.pool == self.pool
+            total = (await conn.execute(select(func.count()).select_from(sandboxes).where(in_pool))).scalar_one()
+            if total >= cap:
+                return None
+            supply = (
                 await conn.execute(
-                    select(func.count()).select_from(sandboxes).where(sandboxes.c.pool == self.pool)
+                    select(func.count())
+                    .select_from(sandboxes)
+                    .where(in_pool, sandboxes.c.state != SandboxState.DESTROYING.value)
                 )
             ).scalar_one()
-            if total >= limit:
+            if supply >= limit:
                 return None
             row = dict(
                 id=str(uuid.uuid4()),

@@ -52,7 +52,7 @@
 ```
 
 - **分配优先级**：READY > PAUSED > 等待（PAUSING / CREATING 中的）> 排队。
-- **容量**：所有状态的记录都计入总数，总数不超过 `max_size`，补货目标为 `target_size`。
+- **容量**：所有状态的记录都计入总数，总数不超过 `max_size`；补货目标为 `target_size`，**补货目标不数 DESTROYING**（它不可能再借给任何人；但在云上还活着，所以照样计入 `max_size`）。合在一起数时，一次卡住的销毁会让 `target_size` 小于 `max_size` 的池子停止补货（2026-10-16 实测，见下方「归还」）。
 - **预热**：新沙箱先执行 `warmup_code`（默认 `import numpy, pandas, matplotlib`），再进入 READY。暂停时解释器状态一并保存，恢复后是热的。
 - **过渡态接管**：执行者崩溃后，其他副本在 `op_deadline` 之后接管。
   - 截止时间按操作区分：创建、预热、暂停 120s；恢复 60s；销毁 30s。
@@ -106,6 +106,7 @@
   - 过期由维护循环回收，条件 CAS（`expires_at <= now`）不会覆盖同时发生的续期。
 - 归还：等沙箱销毁完成再返回（约 0.3s），副本随后崩溃也不会占住容量。
   - 销毁失败时（极少见）仍返回 200，沙箱停在 DESTROYING、继续占着容量，`destroy_timeout_s` 后由维护循环重试；记录 `destroy_failed` 事件，可在 `/v1/pool/stats` 里看到。
+  - 实测最常见的销毁失败是 `409 PAUSING or RESUMING 状态下不允许删除`：`pause` 返回 204 后平台状态机可能滞后数分钟（实测 8.5 分钟）。这期间补货照常进行（补货目标不数 DESTROYING），只是可用容量少一台。
 - 平台侧的超时只作兜底：借出期间为「借用剩余时间 + 60s」（续期时同步）；空闲 READY 由保活续期。
 - 代为执行超时（超过请求里的 `timeout_s`）不是后端故障，不返回 502：
   - `run_code` 返回 200，`error.name` 为 `TimeoutError`；`commands` 返回 200，`exit_code=-1`，`error` 以 `TimeoutError` 开头。

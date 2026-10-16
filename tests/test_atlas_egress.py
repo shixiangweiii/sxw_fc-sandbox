@@ -1,4 +1,5 @@
-"""阶段 1（为 Atlas 集成加的）：借用级出网策略、入站关闭、输出上限、超时保留部分输出。
+"""阶段 1（为 Atlas 集成加的）：借用级出网策略、入站关闭、输出上限、超时保留部分输出，
+以及销毁卡住时补货不停（E 段，Atlas per-call 用法在真实云端撞出来的）。
 
 【定】每条判据都配一个**反向**。本仓已经栽过四次「判据落在守卫重叠区」，
 形态都一样：一个恒真的实现也能让判据全绿。这里的配对分别排除：
@@ -8,6 +9,7 @@
     「一律拒绝交付」        ← B1 要求正常情况下必须交付成功
     「恒报 truncated」      ← C2 要求没超限时必须为 False
     「超时一律空输出」      ← D1 要求交回已收到的那段
+    「补货目标数 DESTROYING」← E1 要求补得上 ／「容量不数 DESTROYING」← E2 要求借不到
 
 真实云端复核见 scripts/probe_code_pool_network.py（出网边界、入站裸奔）。
 """
@@ -17,7 +19,7 @@ import json
 import pytest
 
 from sandbox_pool.egress import DENY_ALL, EgressPolicy, policy_network
-from sandbox_pool.models import SandboxOpError
+from sandbox_pool.models import SandboxOpError, SandboxState, WaitTimeout
 from tests.conftest import wait_until
 
 # ---------------- A. 默认断网 ＋ 关公开访问 ----------------
@@ -148,3 +150,45 @@ async def test_d1_timeout_returns_the_output_produced_so_far(make_pool, provider
     assert r.error.startswith("TimeoutError")
     assert "compiling" in r.stdout, "超时前已经打印出来的行必须交回去"
     assert (await pool.stats())["events"].get("exec_timeout") == 1
+
+
+# ---------------- E. 销毁卡住的沙箱不算库存，但照样占容量 ----------------
+#
+# 真实云端撞到的：归还时销毁撞平台 ``409 PAUSING or RESUMING``，状态机滞后 8.5 分钟。
+# 原来补货目标数的是全部记录，卡在 DESTROYING 的那台一直「算作库存」，
+# ``target_size=1`` 的池子一台都不补，下一个借用方白等到 wait_timeout_s。
+#
+# 配对排除两种实现：
+#     「补货目标照旧数 DESTROYING」  ← E1 要求能补上一台、借得到
+#     「DESTROYING 连容量都不数」    ← E2 要求 max_size 用满时照样借不到（它在云上还活着）
+
+
+async def test_e1_stuck_destroy_does_not_block_replenishment(make_pool, provider):
+    pool = await make_pool(target_size=1, max_size=3, pause_enabled=False)
+    await wait_until(lambda: _count_states(pool, READY=1))
+    first = await pool.allocator.acquire()
+    provider.fail_kill = 10_000  # 销毁一直失败，模拟平台一直回 409
+    await pool.allocator.release(first.lease_id)
+    stuck = await pool.store.get_sandbox(first.sandbox_row_id)
+    assert stuck["state"] == SandboxState.DESTROYING.value
+
+    second = await pool.allocator.acquire(wait_timeout_s=3)
+    assert second.sandbox_row_id != first.sandbox_row_id, "借到的必须是补上来的新沙箱"
+    assert sum((await pool.store.count_by_state()).values()) <= 3
+
+
+async def test_e2_stuck_destroy_still_counts_against_max_size(make_pool, provider):
+    pool = await make_pool(target_size=1, max_size=1, pause_enabled=False)
+    await wait_until(lambda: _count_states(pool, READY=1))
+    first = await pool.allocator.acquire()
+    provider.fail_kill = 10_000
+    await pool.allocator.release(first.lease_id)
+
+    with pytest.raises(WaitTimeout):
+        await pool.allocator.acquire(wait_timeout_s=0.5)
+    assert await pool.store.count_by_state() == {SandboxState.DESTROYING.value: 1}
+
+
+async def _count_states(pool, **want) -> bool:
+    got = await pool.store.count_by_state()
+    return all(got.get(state, 0) == n for state, n in want.items())

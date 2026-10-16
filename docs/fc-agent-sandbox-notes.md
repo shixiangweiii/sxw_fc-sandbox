@@ -99,6 +99,7 @@
 `409 PAUSING or RESUMING 状态下不允许删除`。对「借→还→立刻销毁」的高频用法影响很大：
 归还时的销毁会被拒、沙箱卡在 DESTROYING 并继续占容量，直到平台状态机走完。
 处置是这类用法关掉暂停（`POOL_PAUSE_ENABLED=false`）—— 归还即销毁本来就不从暂停里获益。
+池子侧另修了一处：补货目标不再数 DESTROYING（容量上限仍数），卡住的销毁不再让 `target_size` 小的池子停止补货。
 
 **基础镜像带的 Python 包比文档说的多 —— 实测 105 个**（`pip list` 全量枚举）：
 除 numpy / pandas / matplotlib 外，还有 scipy、scikit-learn、seaborn、plotly、bokeh、
