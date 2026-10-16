@@ -12,6 +12,7 @@ from typing import Optional
 from sandbox_pool.config import PoolConfig
 from sandbox_pool.core.lifecycle import Lifecycle
 from sandbox_pool.models import TRANSITIONAL_STATES, LeaseState, SandboxState
+from sandbox_pool.egress import DENY_ALL, policy_network
 from sandbox_pool.provider.base import SandboxNotFound
 from sandbox_pool.store.repository import (
     KV_CLEANUP_AT,
@@ -309,10 +310,15 @@ class Maintainer:
             t0 = time.perf_counter()
             timeout = self.cfg.ready_platform_timeout_s
             created_at = self.lc.now()
+            # 【定】躺在池子里等人借的沙箱**默认断网、默认不让公网直达**。
+            # 预热代码（import numpy…）不需要网，所以这不影响补货；
+            # 借用方要联网得在 POST /v1/leases 里显式要，由 allocator 下发并核对回显。
             provider_id = await self.provider.create(
                 self.cfg.template,
                 {"pool": self.cfg.pool_name, "pool_row": row["id"], "replica": self.replica_id},
                 timeout,
+                network=policy_network(DENY_ALL) if self.cfg.egress_default_deny else None,
+                secure=self.cfg.block_public_ingress,
             )
             await self.lc.event("create", sandbox_row_id=row["id"], duration_ms=(time.perf_counter() - t0) * 1000)
             now = self.lc.now()

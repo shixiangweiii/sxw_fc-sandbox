@@ -69,6 +69,32 @@ class PoolConfig:
     # 其余请求体（JSON）的大小上限，在鉴权之前生效
     max_body_bytes: int = 1024 * 1024
 
+    # ---------- 出网 / 入站（2026-10-16，为 Atlas 集成加的）----------
+    # 池子里的沙箱**创建时就断网**（deny_out=0.0.0.0/0，连 DNS 一起断，实测），
+    # 借用方要联网得在借用时显式要（POST /v1/leases 的 egress）。
+    #
+    # 【定】默认必须是「断」，因为失败方向不对称：
+    #   默认断 → 借用方忘了要网，命令跑不通，**看得见**；
+    #   默认开 → 借用方忘了设策略，数据悄悄出去了，**看不见**。
+    # 实测（scripts/probe_code_pool_network.py）：不传 network 时公网完全开放；
+    # 而「内网地址不可达」是观察到的现象、**不是平台的保证**（沙箱在
+    # 169.254.0.21/30 的孤立链路上，每个目标都有路由，丢包在网关那端，
+    # 分不出「拦了」还是「那边没东西」）—— 所以不能依赖它。
+    egress_default_deny: bool = True
+    # 关掉「公网直达沙箱端口」（平台要求同时 secure=True）。
+    #
+    # 实测：不关的话，沙箱里 `python3 -m http.server 8080` 起的服务，
+    # 从公网**不带任何令牌**请求 https://8080-<id>.<domain>/ 返回 200。
+    # 模型在沙箱里随手起的调试服务会直接暴露在公网上。
+    block_public_ingress: bool = True
+    # 代为执行时单条流（stdout / stderr）最多回传多少字节；超出截断并如实报告真实字节数。
+    #
+    # 【定】截断必须**说出来**：调用方拿一段被砍掉一半的输出当完整结果用，
+    # 而它没有任何办法看出来。commands 走流式回调边收边截，所以这个上限
+    # 同时保护池子自己的内存；run_code 的结果由 SDK 一次性返回，只能事后截
+    # （见 e2b_provider.run_code 的注释）。
+    max_output_bytes: int = 256 * 1024
+
     # ---------- agent 子系统（每个用户一个常驻 agent，引擎可选 opencode / pi，见 sandbox_pool/agent/）----------
     agent_enabled: bool = False
     # 独立的池名：agent 沙箱的库记录与云端元数据 pool 都用它，与代码执行池互不影响

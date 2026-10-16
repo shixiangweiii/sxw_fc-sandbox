@@ -144,6 +144,12 @@ leases = Table(
     Column("wait_ms", Float),
     # 借用方身份（鉴权开启时为 key 的名称），只有借用方本人和管理员能操作
     Column("client_id", String(64)),
+    # 本次借用实际生效的出网策略，以及**平台回显**的那一份（JSON）。
+    # 【定】两份都要存：一份是「我要求的」，一份是「平台说它做了的」。
+    # 只存前者的话，「下发失败但没人发现」与「下发成功」在事后不可区分 ——
+    # 而借用方正是靠回显判断「这台沙箱到底有没有网」。
+    Column("egress", Text),
+    Column("egress_platform", Text),
     Index("ix_leases_pool_state", "pool", "state"),
 )
 

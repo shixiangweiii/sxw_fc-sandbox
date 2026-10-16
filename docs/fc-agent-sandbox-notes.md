@@ -56,6 +56,63 @@
   - 默认用户 user（sudo 组），x86_64，Debian 13，PID 1 为 systemd；
   - 自带 git / python3 / pip3 / node / npm / curl / tar，没有 unzip。
 
+### 0.2 出网 / 入站 / Volume（2026-10-16 实测，为 Atlas 集成做的摸底）
+
+脚本：`scripts/probe_code_pool_network.py`、`scripts/probe_volume_cache.py`、
+`scripts/probe_template_deps.py`、`scripts/probe_phase1_cloud.py`。
+
+**默认（不传 `network`、不传 `secure`，即代码执行池改造前的建法）**：
+- `get_info().network` 回显 `null`；**公网完全开放**（任意 HTTPS 200）。
+- 元数据地址 `100.100.100.200:80`、`10.0.0.1` / `172.16.0.1` / `192.168.0.1` / `169.254.169.254` 均 timeout。
+- 平台 DNS `100.100.2.136:53` **可达**。
+- ⚠️ **「内网不可达」是观察到的现象，不是平台的保证**：沙箱只有一张网卡
+  `eth0 169.254.0.21/30`，所有路由一律 `via 169.254.0.22`，每个目标都**有**路由，
+  丢包发生在网关那端 —— 分不出「平台拦了」还是「那边没东西」。不要依赖它。
+- ⚠️ **入站裸奔**：沙箱里 `python3 -m http.server 8080`，从外部**不带令牌**请求
+  `https://8080-<id>.<domain>/` 返回 **200**。这类沙箱也没有 `traffic_access_token`。
+
+**`update_network` 对非 secure 沙箱**：接受、生效、可逆，调用约 0.15s，`get_info` 会回显策略。
+- `deny_out=["0.0.0.0/0"]` ＋ `allow_out=[]` → **彻底断网，连 DNS 一起断**（`gaierror`）。
+- 白名单（`allow_out` 填域名）→ 放行域名通、未放行域名 `000`、DNS 保留。
+- ⚠️ **按域名的过滤发生在 80/443 的 SNI 层**：对未放行目标做裸 TCP 连接**照样 connected**。
+  拿 TCP 可达性判「拦没拦」会得到假阴性 —— 必须发真实 TLS 请求才测得出来。
+
+**`secure=True` ＋ `allow_public_traffic=False`（阶段 1 改造后的建法）**：
+- 入站探测从 200 变成 **403**，洞堵上了。
+- **envd 不受影响**：`commands` / `files` 正常，**丢掉缓存句柄重新 `connect` 之后也正常**。
+
+**Volume**：`create_volume` 成功（OSS 后端，状态直接 `AVAILABLE`，建的时候**不要**角色），
+但 `volume_mounts` 挂载一路失败：
+1. 不配角色 → `400 OSS mount requires Function role (template executionRoleArn / CreateSandbox
+   metadata fc.sandbox.auth.role / Volume mountConfig.role)`；
+2. endpoint 不带 scheme → `400 ... doesn't match expected format`（要 `https://oss-cn-hangzhou.aliyuncs.com`）；
+3. 配好最小权限 RAM 角色（信任 `fc.aliyuncs.com`，只给一个 bucket 的读写）＋ 带 scheme 之后
+   → **`500 an internal error has occurred`**，两条传角色的路（Volume `mountConfig.role` 与沙箱
+   metadata `fc.sandbox.auth.role`）、两个模板、干净状态重试均相同。
+   疑似该能力在本账号未开通（官方文档 URL 结尾是 `-test-invitation`，即邀测）。
+   请求 ID：`7fedb370-5194-4f97-9fd5-d92348da16a3`、`5ec3ecd3-8012-42b5-93a5-38f765e51041`。
+- ⚠️ 即便开通了也还有一个没测过的点：OSS 挂载是对象存储做的 FUSE，而 pip 装包是
+  「大量小文件读写」—— 最不适合对象存储的模式。**「Volume 能解决依赖问题」目前仍是假设。**
+
+**`pause` 的 204 不等于已经暂停完（2026-10-16 实测）**：`pause` 返回 204 之后，
+平台可能在 PAUSING/RESUMING 状态里停留**数分钟**（实测 8.5 分钟）。这期间 `kill` 返回
+`409 PAUSING or RESUMING 状态下不允许删除`。对「借→还→立刻销毁」的高频用法影响很大：
+归还时的销毁会被拒、沙箱卡在 DESTROYING 并继续占容量，直到平台状态机走完。
+处置是这类用法关掉暂停（`POOL_PAUSE_ENABLED=false`）—— 归还即销毁本来就不从暂停里获益。
+
+**基础镜像带的 Python 包比文档说的多**：除 numpy / pandas / matplotlib 外，
+实测 `scipy`（1.18.1）与 `jinja2` 也在。所以「要不要预装」得按实际 import 试，不能照文档猜。
+
+**预装依赖的模板**（`scripts/build_pyagent_template.py`，11 个常用 Python 包）：
+| | 预装模板 | 基线模板 |
+|---|---|---|
+| 建沙箱（3 次中位） | 444ms | 333ms |
+| 依赖 | import 3.5s | `pip install` **32.2s** |
+| 要不要网 | **不要** | **要** |
+
+模板构建 71s（一次性）。**断网沙箱里 11 个包全部 import 成功，`run_code` 正常。**
+⚠️ 基线那 32s 是打了折的：`requests` / `httpx` / `PIL` / `yaml` / `dateutil` 镜像里本来就有。
+
 ### 0.1 与 E2B 的关系（实测取证）
 
 结论：**兼容 E2B 协议，实现不是 E2B 开源代码**。阿里在 FC 自有基础设施上重新实现了 E2B 的 API 和沙箱内协议。
@@ -128,7 +185,8 @@ sbx2.kill()                            # 终止释放
 | --- | --- |
 | 支持 | 创建、连接、查询（list）、暂停、恢复、设置超时、终止；commands、files（含 metadata）、代码执行、`get_host` |
 | 受限（仅保持调用兼容，勿做生产依赖） | Sandbox Logs 可能返回空；Network Config Update 可能返回成功但不生效；Metrics 仅 CPU/内存可信，磁盘/页缓存为占位值 |
-| 不支持（非 E2B 兼容主路径） | Snapshot、Volume、Team、Access Token 管理 |
+| 不支持（非 E2B 兼容主路径） | Snapshot、Team、Access Token 管理 |
+| **Volume：支持，但只能走 POP API 建** | `POST /volumes` 返回 400 `CreateVolumeNotSupported`（"use the POP CreateVolume API"），`GET /volumes` 正常。用 `alibabacloud_fcsandbox20260509` 的 `create_volume` 建（OSS / AgenticBucket / AgenticFS 三种后端），再用 E2B SDK 的 `volume_mounts={挂载路径: volume 名}` 挂。**2026-10-16 实测：建得了，挂不上** —— 见 0.2 |
 | 走 FC Extensions | VPC、OSS 挂载、日志采集、监控告警 |
 
 ## 3. 模板（Template）

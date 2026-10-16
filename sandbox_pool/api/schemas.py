@@ -1,11 +1,32 @@
+import json
 from typing import Optional
 
 from pydantic import BaseModel, Field
 
 
+def _json_or_none(raw) -> Optional[dict]:
+    """库里存的是 JSON 文本；解析不了就当没有，不让一条坏记录把整个查询打挂。"""
+    if not raw:
+        return None
+    try:
+        v = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return v if isinstance(v, dict) else None
+
+
 class AcquireRequest(BaseModel):
     wait_timeout_s: Optional[float] = Field(None, ge=0, description="最长等待秒数，默认并受限于服务端配置")
     lease_ttl_s: Optional[float] = Field(None, gt=0, description="借用期限秒数，默认并受限于服务端配置")
+    egress: Optional[dict] = Field(
+        None,
+        description=(
+            "本次借用的出网策略 {mode, allow_out, deny_out}。**不传 = 彻底断网**（含 DNS）。"
+            'mode="allowlist" ＋ allow_out 填域名 = 只放行这些域名；mode="open" = 放行公网'
+            "（强制屏蔽的内网与元数据网段去不掉）。服务端下发后会读回平台回显核对，"
+            "对不上这次借用直接失败（502）"
+        ),
+    )
 
 
 class RenewRequest(BaseModel):
@@ -23,10 +44,21 @@ class LeaseOut(BaseModel):
     ended_at: Optional[float] = None
     wait_ms: Optional[float] = None
     client_id: Optional[str] = None
+    # 本次借用生效的出网策略，以及**平台回显**的那一份。
+    # 调用方据此自己再核对一次 —— 服务端已经核对过，但「池子说它核对过」
+    # 与「我自己看见回显是对的」是两件事，而借用方拿断网当安全边界用。
+    egress: Optional[dict] = None
+    egress_platform: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: dict) -> "LeaseOut":
-        return cls(lease_id=row["id"], **{k: row[k] for k in cls.model_fields if k != "lease_id"})
+        scalar = {k: row[k] for k in cls.model_fields if k not in ("lease_id", "egress", "egress_platform")}
+        return cls(
+            lease_id=row["id"],
+            egress=_json_or_none(row.get("egress")),
+            egress_platform=_json_or_none(row.get("egress_platform")),
+            **scalar,
+        )
 
 
 class RunCodeRequest(BaseModel):
@@ -41,6 +73,11 @@ class RunCodeResponse(BaseModel):
     text: Optional[str]
     results: list[dict]
     error: Optional[dict]
+    # 截断事实：truncated 为真时上面两条流不完整，*_bytes 是截断前的真实字节数。
+    # 【定】必须说出来 —— 调用方没有别的办法发现自己拿到的是半截输出
+    truncated: bool = False
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
 
 
 class CommandRequest(BaseModel):
@@ -55,6 +92,9 @@ class CommandResponse(BaseModel):
     stdout: str
     stderr: str
     error: Optional[str] = None
+    truncated: bool = False
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
 
 
 # ---------- agent 子系统 ----------

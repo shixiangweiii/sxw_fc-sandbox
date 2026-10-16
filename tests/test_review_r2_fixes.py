@@ -213,7 +213,8 @@ class _TimingOutHandle:
     async def run_code(self, code, language=None, timeout=None):
         await self._timeout()
 
-    async def run(self, cmd, cwd=None, envs=None, timeout=None):
+    async def run(self, cmd, cwd=None, envs=None, timeout=None, on_stdout=None, on_stderr=None):
+        # on_stdout / on_stderr：真驱动改走流式回调收输出（2026-10-16），替身要接住它们
         await self._timeout()
 
 

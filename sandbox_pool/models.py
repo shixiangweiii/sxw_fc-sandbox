@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Optional
 
 
 class SandboxState(str, Enum):
@@ -64,6 +65,9 @@ class LeaseGrant:
     hard_deadline: float
     source: str  # ready / resumed
     wait_ms: float
+    # 本次借用生效的出网策略，以及平台回显的那一份（allocator._apply_egress 核对过才会有值）
+    egress: Optional[dict] = None
+    egress_platform: Optional[dict] = None
 
 
 class PoolError(Exception):

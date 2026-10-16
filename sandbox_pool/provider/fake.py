@@ -19,6 +19,7 @@ from sandbox_pool.provider.base import (
     ExecutionTimeout,
     ProviderSandbox,
     SandboxNotFound,
+    cap_text,
 )
 from sandbox_pool.provider.fake_opencode import FakeOpencodeClient, FakeOpencodeServer
 from sandbox_pool.provider.fake_pi import FakePiClient, FakePiServer
@@ -44,6 +45,14 @@ class FakeProvider:
         # agent 子系统：失败注入与调用记录
         self.fail_create_app = 0
         self.fail_update_network = 0
+        # 每次 create 实际收到的 {network, secure}
+        self.created_with: list[dict] = []
+        # 注入超大输出：下一次 run_command 产出这么多字节（判据用，验截断与真实字节数）
+        self.next_output_bytes = 0
+        # 注入「超时但已经产出了一段」：下一次 run_command 先产出这段再超时
+        self.next_timeout_partial: str = ""
+        # update_network 之后回显要不要故意写错（判据：Atlas 读回核对那一道）
+        self.echo_wrong_network: Optional[dict] = None
         self.network_updates: list[tuple[str, dict]] = []
         # 这些模板建出的 app 沙箱里跑 pi 桥接进程，其余跑 opencode
         self.pi_templates: set[str] = {"tpl-pi"}
@@ -82,8 +91,12 @@ class FakeProvider:
         self._sweep()
         return len(self.sandboxes)
 
-    async def create(self, template: str, metadata: dict[str, str], timeout_s: float) -> str:
+    async def create(self, template: str, metadata: dict[str, str], timeout_s: float,
+                     *, network=None, secure: bool = False) -> str:
         self.calls.append(("create", template))
+        # 记下建沙箱时实际传进来的出网 / 入站设置：判据要能区分
+        # 「池子说它默认断网」和「池子真的传了断网规则」
+        self.created_with.append({"network": dict(network) if network else None, "secure": secure})
         await self._sleep(self.latency_s)
         if self.fail_create > 0:
             self.fail_create -= 1
@@ -91,6 +104,8 @@ class FakeProvider:
         sid = f"fake-{uuid.uuid4().hex[:12]}"
         self.sandboxes[sid] = dict(
             state="running",
+            network=({**network, "allow_public_traffic": False} if secure else dict(network or {})) or None,
+            secure=secure,
             metadata=dict(metadata),
             started_at=time.time(),
             ns={},
@@ -161,7 +176,8 @@ class FakeProvider:
             self.exec_timeouts -= 1
             raise ExecutionTimeout(f"execution exceeded {timeout_s:g}s")
 
-    async def run_code(self, sandbox_id, code, *, language, timeout_s, sandbox_timeout_s) -> CodeResult:
+    async def run_code(self, sandbox_id, code, *, language, timeout_s, sandbox_timeout_s,
+                       max_output_bytes: int = 256 * 1024) -> CodeResult:
         sb = self._running(sandbox_id)
         self._maybe_exec_timeout(timeout_s)
         out = io.StringIO()
@@ -171,14 +187,29 @@ class FakeProvider:
                 exec(code, sb["ns"])  # noqa: S102 - 仅测试
         except Exception as e:  # noqa: BLE001
             error = {"name": type(e).__name__, "value": str(e), "traceback": ""}
-        return CodeResult(stdout=out.getvalue(), stderr="", text=None, results=[], error=error)
+        text, total, cut = cap_text(out.getvalue(), max_output_bytes)
+        return CodeResult(stdout=text, stderr="", text=None, results=[], error=error,
+                          truncated=cut, stdout_bytes=total, stderr_bytes=0)
 
-    async def run_command(self, sandbox_id, cmd, *, cwd, envs, timeout_s, sandbox_timeout_s) -> CommandResult:
+    async def run_command(self, sandbox_id, cmd, *, cwd, envs, timeout_s, sandbox_timeout_s,
+                          max_output_bytes: int = 256 * 1024) -> CommandResult:
         self._running(sandbox_id)
+        # 真驱动走流式回调，超时时能交回已经收到的那一段；假驱动用这个旋钮模拟同一件事
+        if self.next_timeout_partial:
+            partial, self.next_timeout_partial = self.next_timeout_partial, ""
+            text, total, cut = cap_text(partial, max_output_bytes)
+            raise ExecutionTimeout(f"command exceeded {timeout_s:g}s", stdout=text,
+                                   truncated=cut, stdout_bytes=total)
         self._maybe_exec_timeout(timeout_s)
+        if self.next_output_bytes:
+            n, self.next_output_bytes = self.next_output_bytes, 0
+            text, total, cut = cap_text("x" * n, max_output_bytes)
+            return CommandResult(exit_code=0, stdout=text, stderr="",
+                                 truncated=cut, stdout_bytes=total, stderr_bytes=0)
         if cmd.startswith("exit "):
-            return CommandResult(exit_code=int(cmd.split()[1]), stdout="", stderr="failed")
-        return CommandResult(exit_code=0, stdout=f"ran: {cmd}\n", stderr="")
+            return CommandResult(exit_code=int(cmd.split()[1]), stdout="", stderr="failed", stderr_bytes=6)
+        out = f"ran: {cmd}\n"
+        return CommandResult(exit_code=0, stdout=out, stderr="", stdout_bytes=len(out.encode()))
 
     async def write_file(self, sandbox_id, path, data, *, sandbox_timeout_s) -> None:
         self._running(sandbox_id)["files"][path] = bytes(data)
@@ -223,8 +254,12 @@ class FakeProvider:
         self.network_updates.append((sandbox_id, network))
 
     async def get_network(self, sandbox_id: str):
+        # echo_wrong_network：判据用。它模拟「平台没按我说的做，却返回了成功」——
+        # 没有这个旋钮，「从不核对回显」的实现与正确实现不可区分
+        if self.echo_wrong_network is not None:
+            return dict(self.echo_wrong_network)
         sb = self._get(sandbox_id)
-        return {**sb.get("network", {}), "allow_public_traffic": False}
+        return {**(sb.get("network") or {}), "allow_public_traffic": False}
 
     async def write_files(self, sandbox_id: str, files: dict, *, sandbox_timeout_s: float) -> None:
         sb = self._running(sandbox_id)

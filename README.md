@@ -9,7 +9,10 @@
 - **预热池**：启动后补足 5 个沙箱，并预先 `import numpy, pandas, matplotlib`。空闲 60s 后暂停，暂停时连同内存状态一起保存，按需恢复约 2s，恢复后解释器仍是热的。可用 `min_hot` 保留若干个始终运行的热沙箱，并自动续期平台超时。
 - **借用模型**：一次借用对应一个任务，借用期内独占沙箱，解释器状态保持。借用期限 10 分钟，可续期，最长 60 分钟。**归还即销毁**，沙箱不在调用方之间复用，随后补一个新的。
 - **排队**：池满后排队（上限 10 个，先来先服务），最长等待 180s；队列满返回 429，等待超时返回 504。可选严格先来先服务模式。
-- **代为执行**：在借到的沙箱里执行 `run_code`、`commands`、文件读写。
+- **代为执行**：在借到的沙箱里执行 `run_code`、`commands`、文件读写。单条输出流超过 `POOL_MAX_OUTPUT_BYTES` 会截断，
+  并如实报告截断前的真实字节数；命令超时也会交回已经产出的那段输出。
+- **默认断网 ＋ 关公网直达**：池子里的沙箱建出来就没有网（连 DNS 一起断），端口也不对公网开放。
+  借用时可以用 `egress` 按域名放行；服务端下发后会**读回平台回显核对**，对不上就不把沙箱交出去。
 - **多副本高可用**：副本无状态，所有协调都通过数据库条件更新（CAS）完成，不需要选主。副本崩溃后，其他副本会接管它未完成的操作（按云端实际状态收回或销毁）、清理云端孤儿，并定期对账。本地用「多进程 + 共享 SQLite」模拟，生产可以换 Postgres。
 - **运维**：Bearer Token 鉴权（调用方 / 管理员两类 key，借用绑定到调用方）、排空接口、创建失败熔断、历史记录自动清理、`/v1/pool/stats` 耗时统计。
 - **常驻 agent（agent 子系统，`POOL_AGENT_ENABLED=true`）**：每个用户一个运行在云沙箱里的常驻 agent（DeepSeek 模型、百炼联网搜索 MCP），通过 `/v1/agents/{user_id}/...` 调用：
@@ -84,6 +87,8 @@ scripts/run_local_cluster.sh start
 H="Authorization: Bearer <key-a>"
 # 借用（阻塞等待，最长 180s）
 LEASE=$(curl -s -X POST localhost:8000/v1/leases -H "$H" -H 'content-type: application/json' -d '{}' | python -c 'import json,sys;print(json.load(sys.stdin)["lease_id"])')
+# 要联网就显式放行域名（不传 egress = 彻底断网）：
+#   -d '{"egress": {"mode": "allowlist", "allow_out": ["pypi.org", "files.pythonhosted.org"]}}'
 
 curl -s -X POST localhost:8000/v1/leases/$LEASE/run_code -H "$H" -H 'content-type: application/json' \
      -d '{"code": "import pandas as pd\nx = pd.Series([1,2,3]).sum()\nprint(x)"}'
@@ -98,12 +103,12 @@ curl -s -X DELETE localhost:8000/v1/leases/$LEASE -H "$H"          # 归还：�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/v1/leases` `{wait_timeout_s?, lease_ttl_s?}` | 借用。200 / 429 队列满 / 503 排空中 / 504 等待超时 |
+| POST | `/v1/leases` `{wait_timeout_s?, lease_ttl_s?, egress?}` | 借用。200 / 429 队列满 / 503 排空中 / 504 等待超时。**`egress` 不传 = 彻底断网**；下发后服务端读回平台回显核对，对不上这次借用失败（502）|
 | GET | `/v1/leases/{id}` | 查询借用 |
 | POST | `/v1/leases/{id}/renew` `{ttl_s?}` | 续期（不超过借出后 60 分钟） |
 | DELETE | `/v1/leases/{id}` | 归还（返回时沙箱已销毁） |
-| POST | `/v1/leases/{id}/run_code` `{code, language?, timeout_s?}` | 返回 stdout、stderr、text、results（含图片）、error。执行超时返回 200、`error.name=TimeoutError` |
-| POST | `/v1/leases/{id}/commands` `{cmd, cwd?, envs?, timeout_s?}` | 返回 exit_code、stdout、stderr（退出码非 0 不视为错误）。执行超时返回 200、`exit_code=-1`、`error` 以 `TimeoutError` 开头 |
+| POST | `/v1/leases/{id}/run_code` `{code, language?, timeout_s?}` | 返回 stdout、stderr、text、results（含图片）、error，以及 `truncated` / `stdout_bytes` / `stderr_bytes`。执行超时返回 200、`error.name=TimeoutError` |
+| POST | `/v1/leases/{id}/commands` `{cmd, cwd?, envs?, timeout_s?}` | 返回 exit_code、stdout、stderr（退出码非 0 不视为错误），以及 `truncated` / `stdout_bytes` / `stderr_bytes`。执行超时返回 200、`exit_code=-1`、`error` 以 `TimeoutError` 开头，**并交回超时前已经产出的那段输出** |
 | PUT / GET | `/v1/leases/{id}/files?path=` | 上传 / 下载原始字节（上传默认上限 64 MiB） |
 | GET | `/v1/pool/stats` | 各状态数量、排队数、分配来源、各操作耗时 p50 / p99 |
 | GET | `/v1/sandboxes` | 沙箱列表（管理员）。不含 `lease_id`，借出中的附带借用方和到期时间 |
@@ -115,6 +120,13 @@ curl -s -X DELETE localhost:8000/v1/leases/$LEASE -H "$H"          # 归还：�
 - 其他错误码：401 未认证、403 需要管理员、404 借用或沙箱不存在、409 借用已结束（或沙箱处于过渡态）、413 请求体过大、502 沙箱侧错误。
 - 代码或命令执行超时不是 502：代码可能已经执行了一部分，调用方不要自动重试。
 - 上传文件以外的请求体不超过 1 MiB（`POOL_MAX_BODY_BYTES`），在鉴权之前检查。
+
+> ⚠️ **高频短借用（例如 Atlas 的 cloud_shell：借 → 跑一条命令 → 立刻归还）请关掉暂停**
+> （`POOL_PAUSE_ENABLED=false`）。实测撞到的：沙箱空闲 60s 被暂停，借用请求紧跟着把它恢复、
+> 用完归还要销毁时撞 `409 PAUSING or RESUMING 状态下不允许删除` —— 平台的状态机比 `pause`
+> 的 204 响应滞后了 **8.5 分钟**，期间每 30s 重试一次；而「所有状态都计入容量」意味着
+> 这台卡住的沙箱会挡住补货，下一个借用请求白等到 `wait_timeout_s`（实测 180s）。
+> 归还即销毁的用法本来就不从暂停里得到任何好处。关掉之后借用稳定在 0.4～2.6s。
 
 ## 配置
 
@@ -132,6 +144,10 @@ curl -s -X DELETE localhost:8000/v1/leases/$LEASE -H "$H"          # 归还：�
 | `POOL_WARMUP_CODE` | `import numpy, pandas, matplotlib` | 预热代码 |
 | `POOL_OP_TIMEOUT_S` | 120 | 创建、预热、暂停的截止时间，必须大于 45（否则拒绝启动） |
 | `POOL_MAX_UPLOAD_BYTES` / `POOL_MAX_BODY_BYTES` | 64 MiB / 1 MiB | 上传文件 / 其余请求体的大小上限 |
+| `POOL_EGRESS_DEFAULT_DENY` | true | 池子里的沙箱建出来就断网（借用时可按需放开）|
+| `POOL_PAUSE_ENABLED` | true | **「一次借用 = 一次调用」的高频用法建议设成 false**，见下 |
+| `POOL_BLOCK_PUBLIC_INGRESS` | true | 关掉公网直达沙箱端口（实测不关时不带令牌也能访问）|
+| `POOL_MAX_OUTPUT_BYTES` | 256 KiB | 单条输出流的回传上限，超出截断并报告真实字节数 |
 
 ## 测试
 

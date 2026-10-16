@@ -341,6 +341,20 @@ class Store:
             r = (await conn.execute(select(leases).where(leases.c.id == lease_id))).mappings().first()
             return dict(r) if r else None
 
+    async def set_lease_egress(self, lease_id: str, desired: str, platform: str) -> None:
+        """记下本次借用生效的出网策略与平台回显。
+
+        【定】不带状态条件：它在交付前写，而这条记录的用途是**事后能查**
+        「当时到底是什么策略」。拿状态做条件的话，一次竞态会让这条事实消失，
+        而消失的事实与「没有策略」在事后不可区分。
+        """
+        async def fn(conn):
+            await conn.execute(
+                update(leases).where(leases.c.id == lease_id).values(egress=desired, egress_platform=platform)
+            )
+
+        await self._retry(fn)
+
     async def cas_lease(
         self,
         lease_id: str,

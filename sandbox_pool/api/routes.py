@@ -13,6 +13,7 @@ from sandbox_pool.api.schemas import (
     RunCodeResponse,
 )
 from sandbox_pool.core.pool import SandboxPool
+from sandbox_pool.egress import DENY_ALL, parse_policy
 from sandbox_pool.models import PayloadTooLarge
 
 router = APIRouter()
@@ -47,11 +48,14 @@ async def acquire(
     caller: Caller = Depends(require_caller),
 ):
     pool = _pool(request)
+    # 【定】策略在**进池子之前**校验：非法的 allow_out / deny_out 要在占用任何
+    # 资源之前报 400，而不是借到沙箱之后才失败（失败的请求不得留下状态变化）
     grant = await pool.allocator.acquire(
         wait_timeout_s=body.wait_timeout_s,
         lease_ttl_s=body.lease_ttl_s,
         is_disconnected=request.is_disconnected,
         client_id=caller.name,
+        egress=parse_policy(body.egress, DENY_ALL) if body.egress is not None else None,
     )
     return LeaseOut.from_row(await pool.allocator.get_lease(grant.lease_id))
 

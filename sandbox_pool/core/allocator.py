@@ -1,6 +1,7 @@
 """借用分配、排队、续期、归还，以及借用期内代为执行。"""
 
 import asyncio
+import json
 import logging
 import random
 import time
@@ -9,6 +10,7 @@ from typing import Awaitable, Callable, Optional
 
 from sandbox_pool.config import PoolConfig
 from sandbox_pool.core.lifecycle import Lifecycle
+from sandbox_pool.egress import DENY_ALL, EgressPolicy, policy_network
 from sandbox_pool.models import (
     LeaseGrant,
     LeaseNotActive,
@@ -30,6 +32,22 @@ log = logging.getLogger(__name__)
 # 单次 try_claim 内换候选重试的上限
 _MAX_CLAIM_ATTEMPTS = 10
 
+
+def _egress_matches(desired: dict, platform: Optional[dict]) -> bool:
+    """平台回显是不是我们要的那一份。
+
+    【定】只比 allow_out / deny_out 这两个集合，不整体相等：回显会多带
+    `allow_public_traffic`、可能缺空字段、顺序也不保证。比集合既抓得住
+    「根本没生效」，又不会因为平台多回一个字段就把好沙箱判废。
+
+    【定】platform 为 None（读不到）一律算不匹配 —— 「我无法核对」不等于「通过」。
+    """
+    if not platform:
+        return False
+    for key in ("allow_out", "deny_out"):
+        if set(desired.get(key) or []) != set(platform.get(key) or []):
+            return False
+    return True
 
 class _Heartbeat:
     """排队期间常驻的心跳任务。抢沙箱（包括较慢的恢复）期间照常刷新，不会被其他副本判为超时。
@@ -90,6 +108,7 @@ class Allocator:
         lease_ttl_s: Optional[float] = None,
         is_disconnected: Optional[Callable[[], Awaitable[bool]]] = None,
         client_id: Optional[str] = None,
+        egress: Optional[EgressPolicy] = None,
     ) -> LeaseGrant:
         start = self.lc.now()
         wait = self.cfg.wait_timeout_s if wait_timeout_s is None else min(max(0.0, wait_timeout_s), self.cfg.wait_timeout_s)
@@ -103,7 +122,7 @@ class Allocator:
         if not self.cfg.strict_fifo and await self.store.count_waiting() == 0:
             grant = await self._try_claim(ttl, start, client_id)
             if grant:
-                return await self._hand_over(grant, None, is_disconnected)
+                return await self._hand_over(grant, None, is_disconnected, egress)
             self.kick()
 
         seq = await self.store.enqueue(
@@ -138,7 +157,7 @@ class Allocator:
                         raise PoolDraining("pool is draining")
                     grant = await self._try_claim(ttl, start, client_id, seq) if ahead < available else None
                     if grant:
-                        return await self._hand_over(grant, deadline, is_disconnected)
+                        return await self._hand_over(grant, deadline, is_disconnected, egress)
                     self.kick()
                 await asyncio.sleep(self.cfg.poll_interval_s)
         except asyncio.CancelledError:
@@ -148,9 +167,17 @@ class Allocator:
             await hb.stop()
 
     async def _hand_over(
-        self, grant: LeaseGrant, deadline: Optional[float], is_disconnected: Optional[Callable[[], Awaitable[bool]]]
+        self,
+        grant: LeaseGrant,
+        deadline: Optional[float],
+        is_disconnected: Optional[Callable[[], Awaitable[bool]]],
+        egress: Optional[EgressPolicy] = None,
     ) -> LeaseGrant:
-        """交付前最后确认请求方还在：已断开则立即归还，否则沙箱要占到借用过期。deadline 为 None 表示没有排队。"""
+        """交付前最后确认请求方还在：已断开则立即归还，否则沙箱要占到借用过期。deadline 为 None 表示没有排队。
+
+        【定】出网策略在这里下发并核对 —— 两条认领路径（READY / PAUSED）都收敛到这里，
+        放在任一条上都会漏掉另一条。
+        """
         # 排队记录已在抢到沙箱的同一事务内改为 GRANTED（抢的期间截止时间已到、被判超时的也一样），
         # 沙箱照常交给请求方，不销毁
         if deadline is not None and self.lc.now() > deadline:
@@ -159,7 +186,57 @@ class Allocator:
         if is_disconnected is not None and await is_disconnected():
             await self.lc.end_lease(grant.lease_id, LeaseState.RELEASED, "client disconnected before grant")
             raise WaitTimeout("client disconnected")
+        await self._apply_egress(grant, egress)
         return grant
+
+    async def _apply_egress(self, grant: LeaseGrant, egress: Optional[EgressPolicy]) -> None:
+        """下发本次借用的出网策略，**读回平台回显核对**，对不上就让这次借用失败。
+
+        ── 为什么要读回来（这是第二道闸门）────────────────────────────────
+
+        借用方（例如 Atlas）拿「断网」当安全边界用：断网 ＋ 用完即销毁 ＋ 只有声明过的
+        文件进出，才谈得上「这次执行的副作用是可证明的」。那条链上唯一撑着它的，
+        就是「池子说它下发了 deny-all」这一句话。
+
+        【定】一句话不够。`update_network` 返回成功只说明请求被接受了，
+        平台回显才说明它生效了（实测 get_info().network 会原样回显 deny_out）。
+        核对不上就**不要把沙箱交出去** —— 一条放行了却没验过的闸门，
+        与「验过并通过」在事后完全不可区分。
+
+        【定】**无论借用方要不要网都核对**。只在「要网时」核对的话，最该被保证的
+        那一档（默认断网）反而是唯一没验过的 —— 那正是 E-3 那条教训的形状。
+        """
+        want = egress or DENY_ALL
+        desired = policy_network(want)
+        try:
+            # 池子建沙箱时已经按 DENY_ALL 下发过；只有借用方要别的策略时才需要再发一次。
+            # 读回核对两种情况都做。
+            if desired != policy_network(DENY_ALL) or not self.cfg.egress_default_deny:
+                await self.provider.update_network(grant.sandbox_id, desired)
+            platform = await self.provider.get_network(grant.sandbox_id)
+        except SandboxNotFound as e:
+            await self.lc.end_lease(grant.lease_id, LeaseState.FAILED, "sandbox vanished before egress was applied")
+            raise SandboxOpError(f"sandbox {grant.sandbox_id} not found") from e
+        except Exception as e:  # noqa: BLE001
+            await self.lc.end_lease(grant.lease_id, LeaseState.FAILED, f"egress apply failed: {e}")
+            raise SandboxOpError(f"failed to apply the egress policy: {type(e).__name__}: {e}") from e
+
+        if not _egress_matches(desired, platform):
+            await self.lc.event("egress_mismatch", sandbox_row_id=grant.sandbox_row_id, lease_id=grant.lease_id,
+                                detail=json.dumps({"desired": desired, "platform": platform}, ensure_ascii=False)[:500])
+            await self.lc.end_lease(grant.lease_id, LeaseState.FAILED, "egress readback mismatch")
+            raise SandboxOpError(
+                "the platform did not report the egress policy we asked for; the sandbox was not handed over. "
+                f"desired={desired.get('allow_out')}/{desired.get('deny_out')} "
+                f"platform={(platform or {}).get('allow_out')}/{(platform or {}).get('deny_out')}"
+            )
+        await self.store.set_lease_egress(
+            grant.lease_id,
+            json.dumps({"mode": want.mode, **desired}, ensure_ascii=False, sort_keys=True),
+            json.dumps(platform or {}, ensure_ascii=False, sort_keys=True),
+        )
+        grant.egress = {"mode": want.mode, **desired}
+        grant.egress_platform = dict(platform or {})
 
     async def _try_claim(
         self, ttl: float, wait_started: float, client_id: Optional[str], waiter_seq: Optional[int] = None
@@ -345,13 +422,16 @@ class Allocator:
             return await self._guard(
                 lease,
                 self.provider.run_code(
-                    lease["sandbox_id"], code, language=language, timeout_s=timeout_s, sandbox_timeout_s=sb_timeout
+                    lease["sandbox_id"], code, language=language, timeout_s=timeout_s, sandbox_timeout_s=sb_timeout,
+                    max_output_bytes=self.cfg.max_output_bytes,
                 ),
             )
         except ExecutionTimeout as e:
             await self._exec_timeout(lease, "run_code", e)
             error = {"name": "TimeoutError", "value": str(e), "traceback": ""}
-            return CodeResult(stdout="", stderr="", text=None, results=[], error=error)
+            # 超时也把已经收到的那段交回去（run_code 这条路径上通常是空的，见 provider 的注释）
+            return CodeResult(stdout=e.stdout, stderr=e.stderr, text=None, results=[], error=error,
+                              truncated=e.truncated, stdout_bytes=e.stdout_bytes, stderr_bytes=e.stderr_bytes)
 
     async def run_command(
         self,
@@ -368,12 +448,16 @@ class Allocator:
             return await self._guard(
                 lease,
                 self.provider.run_command(
-                    lease["sandbox_id"], cmd, cwd=cwd, envs=envs, timeout_s=timeout_s, sandbox_timeout_s=sb_timeout
+                    lease["sandbox_id"], cmd, cwd=cwd, envs=envs, timeout_s=timeout_s, sandbox_timeout_s=sb_timeout,
+                    max_output_bytes=self.cfg.max_output_bytes,
                 ),
             )
         except ExecutionTimeout as e:
             await self._exec_timeout(lease, "commands", e)
-            return CommandResult(exit_code=-1, stdout="", stderr="", error=f"TimeoutError: {e}")
+            # 【定】交回已经收到的那段输出。扔掉它，「超时」与「什么都没发生」
+            # 在调用方那里不可区分，而超时的原因通常就写在那些行里。
+            return CommandResult(exit_code=-1, stdout=e.stdout, stderr=e.stderr, error=f"TimeoutError: {e}",
+                                 truncated=e.truncated, stdout_bytes=e.stdout_bytes, stderr_bytes=e.stderr_bytes)
 
     async def write_file(self, lease_id: str, path: str, data: bytes, *, owner: Optional[str] = None) -> None:
         lease, sb_timeout = await self._use(lease_id, owner)

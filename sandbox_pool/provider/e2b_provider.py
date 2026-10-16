@@ -30,8 +30,10 @@ from sandbox_pool.provider.base import (
     CodeResult,
     CommandResult,
     ExecutionTimeout,
+    OutputCap,
     ProviderSandbox,
     SandboxNotFound,
+    cap_text,
 )
 
 if TYPE_CHECKING:
@@ -216,13 +218,34 @@ class E2BProvider:
     def forget(self, sandbox_id: str) -> None:
         self._cache.pop(sandbox_id)
 
-    async def create(self, template: str, metadata: dict[str, str], timeout_s: float) -> str:
+    async def create(
+        self,
+        template: str,
+        metadata: dict[str, str],
+        timeout_s: float,
+        *,
+        network: Optional[dict] = None,
+        secure: bool = False,
+    ) -> str:
+        """建沙箱。
+
+        【定】`allow_public_traffic=False` 平台要求同时 `secure=True`，两者必须一起传。
+        不关它的后果是实测过的：沙箱里 `python3 -m http.server` 起的服务，
+        从公网**不带任何令牌**请求就返回 200。
+        """
+        extra: dict = {}
+        if secure:
+            extra["secure"] = True
+            extra["network"] = {**(network or {}), "allow_public_traffic": False}
+        elif network:
+            extra["network"] = dict(network)
         h = await _retry_stale(
             lambda: AsyncSandbox.create(
                 template=template,
                 timeout=int(timeout_s),
                 metadata=metadata,
                 request_timeout=_CREATE_TIMEOUT,
+                **extra,
                 **self._opts,
             ),
             retry_on=_NOT_SENT_ERRORS,
@@ -306,13 +329,16 @@ class E2BProvider:
                 )
         return out
 
-    async def run_code(self, sandbox_id, code, *, language, timeout_s, sandbox_timeout_s) -> CodeResult:
+    async def run_code(self, sandbox_id, code, *, language, timeout_s, sandbox_timeout_s,
+                       max_output_bytes: int = 256 * 1024) -> CodeResult:
         h = await self._handle(sandbox_id, sandbox_timeout_s)
         started = time.monotonic()
         try:
             ex = await h.run_code(code, language=language, timeout=timeout_s)
         except TimeoutException as e:
             if _execution_timed_out(started, timeout_s):
+                # 【定】run_code 的输出由 SDK 一次性返回，超时这条路径上拿不到已产生的部分
+                # —— 与 commands 不同，那边走流式回调能交回半截输出。如实说：这里是空的。
                 raise ExecutionTimeout(f"execution exceeded {timeout_s:g}s") from e
             raise
         results = []
@@ -323,25 +349,53 @@ class E2BProvider:
         error = None
         if ex.error is not None:
             error = {"name": ex.error.name, "value": ex.error.value, "traceback": ex.error.traceback}
+        out, out_n, out_cut = cap_text("".join(ex.logs.stdout), max_output_bytes)
+        err, err_n, err_cut = cap_text("".join(ex.logs.stderr), max_output_bytes)
         return CodeResult(
-            stdout="".join(ex.logs.stdout),
-            stderr="".join(ex.logs.stderr),
+            stdout=out,
+            stderr=err,
             text=ex.text,
             results=results,
             error=error,
+            truncated=out_cut or err_cut,
+            stdout_bytes=out_n,
+            stderr_bytes=err_n,
         )
 
-    async def run_command(self, sandbox_id, cmd, *, cwd, envs, timeout_s, sandbox_timeout_s) -> CommandResult:
+    async def run_command(self, sandbox_id, cmd, *, cwd, envs, timeout_s, sandbox_timeout_s,
+                          max_output_bytes: int = 256 * 1024) -> CommandResult:
+        """走**流式回调**收输出，边收边按字节截断。
+
+        【定】不用 `r.stdout` 一次性拿，两个理由缺一不可：
+          ① 一条 `cat 大文件` 会把整份内容读进池子的内存（调用方那边的上限拦不住它，
+             因为那时东西已经在池子里了）；
+          ② 超时时 `CommandResult` 根本不存在，已经打印出来的那些行会被一起扔掉 ——
+             而那正是调用方判断「它卡在哪」唯一的依据。
+        """
         h = await self._handle(sandbox_id, sandbox_timeout_s)
         started = time.monotonic()
+        out = OutputCap(max_output_bytes)
+        err = OutputCap(max_output_bytes)
         try:
-            r = await h.commands.run(cmd, cwd=cwd, envs=envs, timeout=timeout_s)
-            return CommandResult(exit_code=r.exit_code, stdout=r.stdout, stderr=r.stderr, error=r.error)
+            r = await h.commands.run(cmd, cwd=cwd, envs=envs, timeout=timeout_s,
+                                     on_stdout=out.feed, on_stderr=err.feed)
+            return CommandResult(exit_code=r.exit_code, stdout=out.text, stderr=err.text, error=r.error,
+                                 truncated=out.truncated or err.truncated,
+                                 stdout_bytes=out.total_bytes, stderr_bytes=err.total_bytes)
         except CommandExitException as e:
-            return CommandResult(exit_code=e.exit_code, stdout=e.stdout, stderr=e.stderr, error=e.error)
+            # 退出码非 0：SDK 抛异常，但回调已经把输出收齐了
+            return CommandResult(exit_code=e.exit_code, stdout=out.text, stderr=err.text, error=e.error,
+                                 truncated=out.truncated or err.truncated,
+                                 stdout_bytes=out.total_bytes, stderr_bytes=err.total_bytes)
         except TimeoutException as e:
             if _execution_timed_out(started, timeout_s):
-                raise ExecutionTimeout(f"command exceeded {timeout_s:g}s") from e
+                # 把回调已经收到的那段交回去 —— 超时的原因通常就写在里面
+                raise ExecutionTimeout(
+                    f"command exceeded {timeout_s:g}s",
+                    stdout=out.text, stderr=err.text,
+                    truncated=out.truncated or err.truncated,
+                    stdout_bytes=out.total_bytes, stderr_bytes=err.total_bytes,
+                ) from e
             raise
 
     async def write_file(self, sandbox_id, path, data, *, sandbox_timeout_s) -> None:

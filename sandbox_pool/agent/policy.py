@@ -16,131 +16,31 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from sandbox_pool.egress import (  # noqa: F401 —— 这些名字仍从本模块导出，既有调用点不用改
+    ALL_TRAFFIC,
+    MANDATORY_DENY,
+    MAX_LIST_ITEMS,
+    MODES,
+    EgressPolicy,
+    _dedup,
+    _is_domain,
+    _is_ip_or_cidr,
+    _overlaps_mandatory,
+    parse_policy,
+    policy_network,
+)
 from sandbox_pool.models import InvalidRequest
 
 log = logging.getLogger(__name__)
 
-# 开放模式下必须屏蔽的内网与元数据地址，调用方的覆盖不能去掉
-MANDATORY_DENY = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "100.100.100.200/32")
-MODES = ("open", "allowlist")
-ALL_TRAFFIC = "0.0.0.0/0"
 MAX_RULE_HOSTS = 10
 MAX_HEADER_VALUE = 2048
-MAX_LIST_ITEMS = 200
 # 沙箱内 opencode 看到的 Key：真实值由平台在出网时注入
 PLACEHOLDER_KEY = "injected-by-platform"
 EGRESS_FILE = "/home/user/.agent/egress.json"
 
-_DOMAIN = re.compile(r"^(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
 _HEADER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
-
-
-def _is_ip_or_cidr(value: str) -> bool:
-    try:
-        ipaddress.ip_network(value, strict=False)
-        return True
-    except ValueError:
-        return False
-
-
-_MANDATORY_NETS = tuple(ipaddress.ip_network(n) for n in MANDATORY_DENY)
-_IPV4_MAPPED = ipaddress.ip_network("::ffff:0:0/96")
-
-
-def _overlaps_mandatory(value: str) -> bool:
-    """放行项与强制屏蔽网段重叠（平台规则 allow_out 优先于 deny_out，重叠即等于去掉了屏蔽）。"""
-    net = ipaddress.ip_network(value, strict=False)
-    if net.version == 6:
-        return net.overlaps(_IPV4_MAPPED)
-    return any(net.overlaps(m) for m in _MANDATORY_NETS)
-
-
-def _is_domain(value: str) -> bool:
-    return len(value) <= 253 and bool(_DOMAIN.match(value))
-
-
-def _dedup(items) -> list[str]:
-    out: list[str] = []
-    for x in items:
-        if x not in out:
-            out.append(x)
-    return out
-
-
-@dataclass(frozen=True)
-class EgressPolicy:
-    mode: str = "open"
-    allow_out: tuple[str, ...] = ()
-    deny_out: tuple[str, ...] = ()
-
-    def to_dict(self) -> dict:
-        return {"mode": self.mode, "allow_out": list(self.allow_out), "deny_out": list(self.deny_out)}
-
-
-def parse_policy(obj: Optional[dict], base: Optional[EgressPolicy] = None, *, strict: bool = True) -> EgressPolicy:
-    """校验并合并策略：obj 中出现的字段覆盖 base。deny_out 只能是 IP / CIDR。
-
-    allow_out 在平台上优先于 deny_out，所以：
-    - IP / CIDR 不能与强制屏蔽的内网、元数据网段重叠（否则等于去掉屏蔽），IPv4 映射的 IPv6 地址一律拒绝；
-    - 域名（支持 *. 通配）只在白名单模式下有意义；开放模式本来就放行全部公网，域名放行项只会让它绕过 deny_out，拒绝。
-
-    strict=False 用于读取库里已存的覆盖（可能早于上述规则写入）：违规的放行项直接丢弃（只会更严格）、记日志，
-    不抛错，避免一条旧记录让该 agent 的装配和维护循环一直失败。格式错误仍然抛错。
-    """
-    base = base or EgressPolicy()
-    if obj is None:
-        return base
-    if not isinstance(obj, dict):
-        raise InvalidRequest("egress policy must be an object")
-    unknown = set(obj) - {"mode", "allow_out", "deny_out"}
-    if unknown:
-        raise InvalidRequest(f"unknown egress fields: {sorted(unknown)}")
-    mode = obj.get("mode", base.mode)
-    if mode not in MODES:
-        raise InvalidRequest(f"egress mode must be one of {MODES}")
-
-    def items(key: str) -> Optional[list[str]]:
-        if key not in obj:
-            return None
-        value = obj[key]
-        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-            raise InvalidRequest(f"{key} must be a list of strings")
-        if len(value) > MAX_LIST_ITEMS:
-            raise InvalidRequest(f"{key} has more than {MAX_LIST_ITEMS} items")
-        return [v.strip().lower() for v in value if v.strip()]
-
-    allow = items("allow_out")
-    deny = items("deny_out")
-    for v in allow or []:
-        if not (_is_domain(v) or _is_ip_or_cidr(v)):
-            raise InvalidRequest(f"invalid allow_out entry {v!r}: expected a domain, IP or CIDR")
-    for v in deny or []:
-        if not _is_ip_or_cidr(v):
-            raise InvalidRequest(f"invalid deny_out entry {v!r}: only IP / CIDR are supported (the platform rejects domains)")
-    allow_out = tuple(_dedup(allow)) if allow is not None else base.allow_out
-    # 合并之后再查放行项：模式可能来自 obj，allow_out 来自 base
-    rejected = {}
-    for v in allow_out:
-        if _is_ip_or_cidr(v):
-            if _overlaps_mandatory(v):
-                rejected[v] = f"overlaps the always-blocked private / metadata ranges {list(MANDATORY_DENY)}"
-        elif mode == "open":
-            rejected[v] = (
-                "domains are only allowed in allowlist mode "
-                "(open mode already allows all public traffic; a domain entry would only bypass deny_out)"
-            )
-    if rejected:
-        if strict:
-            v, why = next(iter(rejected.items()))
-            raise InvalidRequest(f"allow_out entry {v!r} {why}")
-        log.warning("dropping disallowed allow_out entries of a stored egress policy: %s", sorted(rejected))
-        allow_out = tuple(v for v in allow_out if v not in rejected)
-    return EgressPolicy(
-        mode=mode,
-        allow_out=allow_out,
-        deny_out=tuple(_dedup(deny)) if deny is not None else base.deny_out,
-    )
 
 
 def default_policy(spec: str) -> EgressPolicy:
@@ -217,17 +117,17 @@ def load_injections(model_host: str, model_api_key: str, inject_spec: str, env: 
 
 
 def build_network(policy: EgressPolicy, injections: Injections) -> dict:
-    """SDK 的 network 参数（不含 allow_public_traffic，创建时由调用方加上）。"""
-    if policy.mode == "open":
-        deny = _dedup([*MANDATORY_DENY, *policy.deny_out])
-    else:
-        deny = [ALL_TRAFFIC]
-    allow = _dedup([*policy.allow_out, *injections.hosts])
-    return {
-        "allow_out": allow,
-        "deny_out": deny,
-        "rules": {host: [{"transform": {"headers": dict(headers)}}] for host, headers in injections.rules.items()},
-    }
+    """SDK 的 network 参数（不含 allow_public_traffic，创建时由调用方加上）。
+
+    【定】规则本身在 sandbox_pool/egress.py 的 policy_network，这里只负责把
+    凭证注入拼上去 —— 注入域名必须同时出现在 allow_out 里（平台要求），
+    所以它们走 extra_allow，而不是在这里另算一遍 deny/allow。
+    """
+    return policy_network(
+        policy,
+        extra_allow=tuple(injections.hosts),
+        rules={host: [{"transform": {"headers": dict(headers)}}] for host, headers in injections.rules.items()},
+    )
 
 
 def network_version(policy: EgressPolicy, injections: Injections) -> str:
