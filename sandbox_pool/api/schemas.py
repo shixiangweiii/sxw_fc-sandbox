@@ -100,6 +100,23 @@ class CommandResponse(BaseModel):
 # ---------- agent 子系统 ----------
 
 
+class StartSandboxRequest(BaseModel):
+    engine: Optional[str] = Field(None, description="启动前改用的引擎；省略则沿用已保存的设置或默认引擎")
+
+
+class TemplateCacheCreateRequest(BaseModel):
+    template_id: str = Field(..., min_length=1, description="要预热的模板 ID")
+
+
+class DeleteInstanceRequest(BaseModel):
+    row_id: Optional[str] = Field(None, description="库内沙箱行号")
+    provider_id: Optional[str] = Field(None, description="云端实例号；库里没有这条记录时按孤儿删除")
+
+    def require_one(self) -> None:
+        if bool(self.row_id) == bool(self.provider_id):
+            raise ValueError("provide exactly one of row_id or provider_id")
+
+
 class MessageRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=200_000, description="发给 agent 的消息")
     session_id: Optional[str] = Field(None, max_length=64, description="继续已有会话；为空时新建会话")

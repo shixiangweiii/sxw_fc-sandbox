@@ -8,6 +8,8 @@
 
 2026-11-21 新增研究引擎。部署端用 `POOL_AGENT_OPENCODE2_TEMPLATE` 和 `POOL_AGENT_PI1_TEMPLATE` 指定各自模板，将 `POOL_AGENT_DEFAULT_ENGINE` 设为已启用的引擎。业务端从 `GET /v1/agent-engines` 读取可用列表，设置中的引擎名分别为 `opencode2` 和 `pi1`。OpenCode 2 的 shell 工具名为 `shell`，Pi 1 的百炼原生工具名为 `mcp__websearch__bailian_web_search`。接口仍通过 `tool` 事件报告真实工具名。完整配置和验证见[新版研究模板记录](方案设计/2026-11-21-OpenCode2与Pi1云沙箱升级验证.md)。
 
+可以先 `POST /v1/agents/{user_id}/sandbox` 把沙箱启动到可对话，再发消息。不调用这个接口时，发消息和定时任务仍会按需创建沙箱。同源页面 `/console` 用来选择引擎、查看启动耗时并对话。
+
 
 ## 1. 这是什么
 
@@ -48,7 +50,7 @@
 6. **会话、agent 和池各有约束。** 同一会话同时只能有一个运行中任务（冲突返回 409）；每个 agent 默认最多 3 个运行中任务（429）。整个 agent 池默认最多 3 个沙箱（503），创建中、退役中、销毁中的记录均占容量，轮换需要留出余量。不同会话共享同一沙箱工作目录，并发修改同一文件须由业务协调。
 7. **设置持久化与沙箱应用是异步的。** `PATCH /settings` 返回已保存的设置，维护循环在沙箱空闲时重写配置并重载；返回成功不表示新设置已用于运行。修改引擎则触发沙箱轮换，已有任务继续在旧引擎跟进，新会话使用新引擎。
 8. **运行不等待人工交互。** opencode 的权限询问和反问被自动拒绝；pi 扩展的交互由桥接进程自动应答。当前业务 API 没有人工审批或追问答复通道。
-9. **首次调用包含准备时间。** 首次消息或定时触发按需建沙箱、装配配置、创建会话，pi 还可能等待进程冷启动、MCP 缓存或上下文压缩。历史秒级耗时不是 SLA；超时配置与接入处理见第 5、6 节。
+9. **准备时间和发消息可以分开。** `POST /v1/agents/{user_id}/sandbox` 只把沙箱做到 `ACTIVE` 并返回分步耗时，不建会话。不调用时，首次消息或定时触发仍会按需建沙箱。消息阶段还有创建会话，pi 还可能等待进程冷启动、MCP 缓存或上下文压缩。历史秒级耗时不是 SLA；超时配置与接入处理见第 5、6 节。
 
 ## 3. 快速开始
 
@@ -170,11 +172,11 @@ data: {"task_id": "b136…", "state": "SUCCEEDED", "result": "系统架构是 x8
 
 ## 4. 接口参考
 
-本节 `/v1/*` 接口都需要 `Authorization: Bearer <key>`（关闭鉴权的本地开发模式除外）；`GET /healthz` 不鉴权。
+本节 `/v1/*` 接口都需要 `Authorization: Bearer <key>`（关闭鉴权的本地开发模式除外）；`GET /healthz`、操作台 `GET /console` 和管理页 `GET /admin` 不鉴权。
 
 - **身份隔离按 Key 名称。** `mybiz:key-a` 与 `other:key-b` 下同名的 `user_id` 属于不同 agent；同名 Key 轮换密钥值后仍访问原有数据。不同密钥若配置成同一个名称，也会共享该名称下的 agent。
 - **`user_id`** 由业务系统定义，创建时校验长度为 1–128 字符，建议使用稳定且适合 URL 路径的业务 ID。Key 应由业务后端持有，后端负责核对终端用户与 `user_id` 的关系。
-- **自动创建身份的入口：** 发消息、修改设置、GET/PUT 出网策略、创建定时任务。仅创建身份不会分配沙箱；首次消息或定时触发才按需分配。其他查询对不存在的 agent 返回 404。
+- **自动创建身份的入口：** 发消息、修改设置、GET/PUT 出网策略、创建定时任务、`POST /sandbox`。只改设置或出网不会分配沙箱；发消息、定时触发和 `POST /sandbox` 会按需分配。其他查询对不存在的 agent 返回 404。
 - **管理员身份不自动代入业务身份。** `/v1/admin/agents*` 可跨调用方查看；普通 `/v1/agents/{user_id}/*` 即使带管理员 Key，仍按该 Key 的名称隔离。重置或修改业务 agent 时须使用对应调用方身份。
 - **请求体默认上限为 1 MiB**（`POOL_MAX_BODY_BYTES`，鉴权前检查）；字段长度上限与 UTF-8 字节上限同时生效。时间戳统一为 Unix epoch 秒，可带小数。
 
@@ -214,7 +216,12 @@ data: {"task_id": "b136…", "state": "SUCCEEDED", "result": "系统架构是 x8
 | GET | `/v1/agents/{user_id}` | 返回 `user_id`、`agent_id`、`created_at`、`settings`、`settings_version`、`engine`、`egress_override`、`sandboxes` 数组、`running_tasks` ID 数组 |
 | GET | `/v1/agent-engines` | 返回 `default` 与 `engines` 数组；各项含 `name`、`model`、`default`、`capabilities`，pi 还含 `thinking`。这是网关配置声明，不是云模板版本检测 |
 | PATCH | `/v1/agents/{user_id}/settings` | 保存部分设置并返回完整 agent 信息；并发修改不同顶层字段互不覆盖，同一字段以后提交的为准。应用进度见下文 |
-| DELETE | `/v1/agents/{user_id}/sandbox` | 重置当前 `ACTIVE` / `RETIRING` 沙箱，运行中任务记为 `FAILED`，原因 `sandbox reset by user`；返回 `{"destroyed": 数量}`。不删除身份、设置、定时任务和已有结果 |
+| POST | `/v1/agents/{user_id}/sandbox` | 确保沙箱为 `ACTIVE`。body 可省略，或 `{"engine": "已启用的引擎名"}`。已有同引擎 `ACTIVE` 时立即返回，`fresh` 为 false；本次新建或等到装配完成时 `fresh` 为 true。响应含 `sandbox` 与 `boot`。不建会话。池满 503，三次装配失败 502，等待超时 504 |
+| DELETE | `/v1/agents/{user_id}/sandbox` | 重置当前 `ACTIVE` / `RETIRING` / `PAUSED` 沙箱，运行中任务记为 `FAILED`，原因 `sandbox reset by user`；返回 `{"destroyed": 数量}`。不删除身份、设置、定时任务和已有结果 |
+| POST | `/v1/agents/{user_id}/sandbox/pause` | 休眠当前 `ACTIVE` 沙箱。有运行中任务时 409。已经休眠则原样返回。下次启动或发消息会唤醒，会话还在。休眠期间不做健康检查和续期 |
+| GET | `/v1/agents/{user_id}/files?path=` | 列出当前 `ACTIVE` 沙箱的一层目录。`path` 省略时为 `/`。返回 `path` 与 `entries`（`name`、`path`、`type` 为 `file` 或 `dir`、`size`）。没有沙箱时 404。休眠、创建中、恢复中或只有 `RETIRING` 时 409，不连接云端，因此不会唤醒休眠沙箱。路径是文件时 400，目录不存在时 404 |
+| GET | `/v1/agents/{user_id}/files/content?path=` | 下载该绝对路径的文件，响应体为原始字节。目录返回 400，文件不存在返回 404。同样只接受 `ACTIVE` |
+| PUT | `/v1/agents/{user_id}/files?path=` | 把请求体覆盖写入该绝对路径，父目录不存在时会创建。返回 `{"path","size"}`。超过 `max_upload_bytes`（默认 64 MiB）返回 413。这条 PUT 与借用文件上传一样，不走 1 MiB 的通用请求体限制 |
 
 设置字段：
 
@@ -224,6 +231,20 @@ data: {"task_id": "b136…", "state": "SUCCEEDED", "result": "系统架构是 x8
 | `instructions` | 长期说明，写入工作目录的 `AGENTS.md`，最长 20000 字符；空字符串或 null 清空用户说明 |
 | `engine` | agent 使用的引擎：`opencode` / `pi`（必须是已启用的引擎），传 `null` 恢复默认 |
 | `mcp` | agent 级 MCP 字典，格式同 opencode（pi 会转换）。每次替换整个 agent 级字典，再与管理员默认 MCP 按名称浅合并，同名配置以 agent 为准；`{}` / null 只清空 agent 覆盖，不清空管理员默认服务。不要在配置中写真实密钥 |
+
+`POST /sandbox` 在引擎名与已保存值不同时，先按 `PATCH /settings` 写入再装配。未启用的引擎返回 400。重复启动不会为了同一个引擎再写一遍设置。
+
+`boot` 与 `GET /agents/{user_id}` 里每个沙箱的 `boot` 相同：
+
+| 字段 | 说明 |
+| --- | --- |
+| `total_ms` | 装配总耗时。尚未写完 `agent_boot` 时为 null。各已完成步骤的 `duration_ms` 之和等于它 |
+| `running` | 尚未完成的下一步名称。`ACTIVE` 且已有总耗时时为 null |
+| `steps` | 已完成步骤，按顺序：`create`、`health`、`files`、`preload`、`activate`。`opencode2` 在 `create` 之后多一步 `password`。每项含 `name`、`duration_ms`、`finished_at`（Unix 秒） |
+
+进行中的那一步不入库。页面用上一完成步骤的 `finished_at` 到当前时间估算。502 的响应在原有 `detail` 之外带 `attempts`：每次尝试的 `sandbox_row_id`、已完成 `steps`、`error`。其它接口的 502 不带 `attempts`。不调用启动接口时，发消息和定时任务仍会创建沙箱。
+
+本机操作台是 `GET /console`（不鉴权）。页面里填写调用方 Key 和 `user_id`，Key 只留在浏览器标签页。它选择已启用引擎、调用上面的启动接口、用 `fetch` 读对话 SSE，并轮询沙箱状态。右侧的工具过程只来自当前这条 SSE，刷新后不回放。沙箱为 `ACTIVE` 时，右侧还可以按绝对路径列出一层目录、下载文件，或把文件覆盖上传到当前目录；休眠或未启动时页面不发文件请求。
 
 MCP 配置示例（作为 `PATCH /settings` 的 body）：
 
@@ -393,6 +414,16 @@ curl -sS -X POST "$BASE/v1/agents/alice/schedules" \
 | --- | --- | --- |
 | GET | `/v1/admin/agents` | 当前 agent 池中所有调用方的 agent 信息数组，附 `client_id`；沙箱不含访问令牌，`running_tasks` 为任务 ID 数组 |
 | GET | `/v1/admin/agents/stats` | `pool`、`replica`、`engines`、`default_engine`、`sandboxes` 状态计数、`running_tasks` 总数、`local_runners`、`events` 与 `latency_ms`（count / p50 / p99 / max） |
+| GET | `/v1/admin/instances` | 当前账号地域的云端实例（`running` 运行中、`paused` 休眠）与代码池、agent 池库记录的对齐结果。不含 `access_token` 和 `lease_id`。云端有而库里没有为 `orphan`，反过来为 `missing` |
+| POST | `/v1/admin/instances/{row_id}/pause` | 把代码池里空闲的 `READY` 沙箱暂停，不受自动暂停开关限制。已暂停则原样返回。借出中或过渡态 409。agent 沙箱 400，不能休眠 |
+| DELETE | `/v1/admin/instances` | 请求体恰好带 `row_id` 或 `provider_id` 之一。代码池按现有强制销毁（借出中先结束借用）；agent 只销毁这一台，身份、设置和任务历史还在；孤儿按云端实例号 `kill`。过渡态 409 |
+| GET | `/v1/admin/template-caches` | 本团队模板及缓存。每项含 `template_id`、`name`、`cache`（无缓存为 null；有则含 `status`、`progress`、`image_size_mb`、`created_time`、`ready_time`、`status_reason`）。未配置 `ALIBABA_CLOUD_ACCESS_KEY_ID`、`ALIBABA_CLOUD_ACCESS_KEY_SECRET`、`FCSANDBOX_REGION_ID`、`FCSANDBOX_TEAM_ID` 时仍返回 200，`configured` 为 false |
+| POST | `/v1/admin/template-caches` | body `{"template_id"}`。新建缓存并立即返回当前状态，不等到 `Success`。已有 `InProgress` 或 `Success` 时 409，响应带现有 `cache`。未配置凭证 503 |
+| DELETE | `/v1/admin/template-caches/{template_id}` | 删除该模板的缓存。释放后按容量计时的费用停止。未配置凭证 503 |
+
+费用按缓存容量（GiB）和存放小时计算，不是按后来有没有用这个模板启动沙箱。状态 `Evicted` 表示已被平台淘汰，不再计费。这块不暂停、不销毁已经跑着的实例。
+
+本机管理页是 `GET /admin`（不鉴权）。页面里填写管理员 Key。停止等于代码池暂停；删除才会销毁实例。云端列表有约 1.5 秒延迟，删除后刷新仍可能看到刚删掉的实例。模板缓存在同一页的下半部分；有 `InProgress` 时只轮询缓存表。
 
 `local_runners` 只表示所访问副本；顶层 `template` / `model` 保留 opencode 配置语义，多引擎部署看 `engines`。统计基于尚未清理的事件记录，不是永久累计或账单。
 
@@ -691,7 +722,7 @@ curl -sS -X PATCH -H "Authorization: Bearer $KEY" -H 'Content-Type: application/
 
 | 业务约定 | 当前源码 |
 | --- | --- |
-| 接口、字段、鉴权和错误 | [agent_routes.py](../sandbox_pool/api/agent_routes.py)、[schemas.py](../sandbox_pool/api/schemas.py)、[auth.py](../sandbox_pool/api/auth.py)、[app.py](../sandbox_pool/api/app.py) |
+| 接口、字段、鉴权和错误 | [agent_routes.py](../sandbox_pool/api/agent_routes.py)、[schemas.py](../sandbox_pool/api/schemas.py)、[auth.py](../sandbox_pool/api/auth.py)、[app.py](../sandbox_pool/api/app.py)、[操作台](../sandbox_pool/web/index.html) |
 | 设置、续聊、重连与手动触发 | [service.py](../sandbox_pool/agent/service.py) |
 | 任务执行、中止、结果落库 | [runner.py](../sandbox_pool/agent/runner.py) |
 | 轮换、心跳接管、迟到调度与清理 | [maintainer.py](../sandbox_pool/agent/maintainer.py)、[agent_repo.py](../sandbox_pool/store/agent_repo.py) |

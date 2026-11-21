@@ -11,7 +11,7 @@ from sandbox_pool.config import PoolConfig
 from sandbox_pool.core.allocator import Allocator
 from sandbox_pool.core.lifecycle import Lifecycle
 from sandbox_pool.core.maintainer import Maintainer
-from sandbox_pool.models import LeaseState, SandboxBusy, SandboxRecordNotFound, SandboxState
+from sandbox_pool.models import LeaseState, SandboxBusy, SandboxOpError, SandboxRecordNotFound, SandboxState
 from sandbox_pool.provider.base import SandboxProvider
 from sandbox_pool.store.repository import KV_CREATE_BLOCK_UNTIL, KV_DRAINING, Store
 
@@ -117,6 +117,31 @@ class SandboxPool:
             "previous_state": row["state"],
             "lease_ended": lease_ended,
         }
+
+    async def pause_sandbox(self, row_id: str) -> dict:
+        """管理员把一台空闲 READY 沙箱暂停。不受自动暂停开关和 min_hot 限制。"""
+        row = await self.store.get_sandbox(row_id)
+        if row is None or row["pool"] != self.cfg.pool_name:
+            raise SandboxRecordNotFound(f"sandbox {row_id} not found")
+        if row["state"] == SandboxState.PAUSED.value:
+            return {"id": row_id, "provider_id": row.get("provider_id"), "state": row["state"], "changed": False}
+        if row["state"] != SandboxState.READY.value:
+            raise SandboxBusy(f"sandbox {row_id} is {row['state']}, retry later")
+        now = self.lifecycle.now()
+        ok = await self.store.start_pause(
+            row,
+            now=now,
+            owner=self.replica_id,
+            op_deadline=now + self.cfg.op_timeout_s,
+            min_hot=-1,
+        )
+        if not ok:
+            raise SandboxBusy(f"sandbox {row_id} is no longer READY, retry later")
+        await self.maintainer._pause_one(row)
+        fresh = await self.store.get_sandbox(row_id)
+        if fresh is None or fresh["state"] != SandboxState.PAUSED.value:
+            raise SandboxOpError(f"pause failed for sandbox {row_id}")
+        return {"id": row_id, "provider_id": row.get("provider_id"), "state": fresh["state"], "changed": True}
 
     async def stats(self) -> dict:
         counts = await self.store.count_by_state()

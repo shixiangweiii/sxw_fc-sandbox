@@ -1,0 +1,4 @@
+问题：“暂停与恢复功能当前仅对已开通白名单的账号可用。请先完成白名单开通，再调用 sandbox.pause() 或连接已暂停的 Sandbox。”
+
+解法：您好，云沙箱深休眠可以使用2代运行时就没这个限制了：https://aliyun-fc.github.io/fc-docs/docs/zh-CN/01.%E4%BA%91%E6%B2%99%E7%AE%B1/04.%E5%8A%9F%E8%83%BD%E8%AF%B4%E6%98%8E/02.%E6%A8%A1%E6%9D%BF/03.%E9%80%9A%E8%BF%87%20OpenAPI%20%E6%9E%84%E5%BB%BA%E5%92%8C%E7%AE%A1%E7%90%86%E6%A8%A1%E6%9D%BF/#_6
+不需要自己买 ACR 才能构建二代模板。文档示例里用的 test-registry-vpc.cn-beijing.cr.aliyuncs.com/runtime/python:3.12-v1 是平台提供的官方运行时镜像，直接在 CreateTemplate API 里指定 image 路径 + generation=2 就能构建二代模板。

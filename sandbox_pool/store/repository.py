@@ -636,6 +636,29 @@ class Store:
         async with self._read() as conn:
             return {k: n for k, n in (await conn.execute(q)).all()}
 
+    async def events_for_sandboxes(self, sandbox_row_ids: list[str], kinds: Iterable[str]) -> dict[str, list[dict]]:
+        """按沙箱记录读取指定种类的事件，按写入顺序排列。行被删掉后事件仍在。"""
+        ids = [row_id for row_id in sandbox_row_ids if row_id]
+        out: dict[str, list[dict]] = {row_id: [] for row_id in ids}
+        if not ids:
+            return out
+        q = (
+            select(events)
+            .where(
+                and_(
+                    events.c.pool == self.pool,
+                    events.c.sandbox_row_id.in_(ids),
+                    events.c.kind.in_(list(kinds)),
+                )
+            )
+            .order_by(events.c.id)
+        )
+        async with self._read() as conn:
+            for row in (await conn.execute(q)).mappings():
+                item = dict(row)
+                out.setdefault(item["sandbox_row_id"], []).append(item)
+        return out
+
     # ---------- 历史清理 ----------
 
     async def purge_history(self, *, before: float, batch: int = 500) -> dict[str, int]:

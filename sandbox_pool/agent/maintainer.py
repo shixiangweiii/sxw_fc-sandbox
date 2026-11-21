@@ -7,8 +7,8 @@
 - 定时任务：到期的用 CAS 推进 next_run_at 后触发（多副本下每次只触发一次）；
 - 全池周期任务：对账、历史清理（pool_kv 时间戳 CAS，每个周期一个副本）。
 
-agent 沙箱不暂停（按 Eco 规则）。健康检查用 HTTP 访问 /global/health（opencode serve 与 pi 桥接进程都提供），
-不调用 connect()。
+agent 沙箱默认不自动暂停。操作台可以休眠一台空闲沙箱；休眠期间不做健康检查和续期，下次请求再恢复。
+健康检查仍只用 HTTP，不调用 connect()。
 """
 
 import asyncio
@@ -27,8 +27,11 @@ log = logging.getLogger(__name__)
 
 # 服务停机期间错过的定时触发不补跑：到期超过这个时长的只推进到下一次
 _MISSED_GRACE_S = 300
-_TRANSITIONAL = (SandboxState.CREATING, SandboxState.WARMING, SandboxState.DESTROYING)
-_SERVING = (SandboxState.ACTIVE, SandboxState.RETIRING)
+_TRANSITIONAL = (
+    SandboxState.CREATING, SandboxState.WARMING, SandboxState.DESTROYING,
+    SandboxState.PAUSING, SandboxState.RESUMING,
+)
+_SERVING = (SandboxState.ACTIVE, SandboxState.RETIRING, SandboxState.PAUSED)
 
 
 class AgentMaintainer:
@@ -176,6 +179,9 @@ class AgentMaintainer:
                 await self.svc.lc.event("agent_retire", sandbox_row_id=row["id"], detail="rotation with running tasks")
             return
         else:
+            if row["state"] == SandboxState.PAUSED.value:
+                # 休眠中的沙箱不做健康检查和续期，否则探测失败会把它销毁，续期路径还可能把它唤醒。
+                return
             idle_after = self.svc.agent_settings(agent)["idle_destroy_after_s"]
             if idle_after > 0 and not running:
                 if row["activity_kind"] == "schedule":

@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>沙箱 agent 操作台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f1ea;
+      --ink: #1d1c19;
+      --muted: #5e5a52;
+      --line: #d9d2c5;
+      --card: #fffdf8;
+      --accent: #0d6b58;
+      --accent-ink: #f7fffc;
+      --warn: #8a4b12;
+      --bad: #8d2b2b;
+      --ok: #0d6b58;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 15px/1.5 "Iowan Old Style", "Palatino Linotype", Palatino, "Songti SC", serif;
+      color: var(--ink);
+      background: var(--bg);
+    }
+    header, .layout { width: min(1180px, calc(100% - 32px)); margin: 0 auto; }
+    header { padding: 28px 0 8px; }
+    h1 { font-size: 28px; font-weight: 600; margin: 0 0 6px; }
+    h2 { font-size: 16px; margin: 0 0 10px; letter-spacing: 0.02em; }
+    .hint { color: var(--muted); margin: 0; font-size: 13px; }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(280px, 0.8fr);
+      gap: 16px;
+      padding: 16px 0 40px;
+      align-items: start;
+    }
+    section, aside {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+    }
+    aside { display: grid; gap: 18px; }
+    main { display: grid; gap: 16px; }
+    label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+    input, select, textarea, button {
+      font: inherit;
+      color: inherit;
+    }
+    input, select, textarea {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+    }
+    textarea { width: 100%; min-height: 84px; resize: vertical; }
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 14px;
+      background: var(--accent);
+      color: var(--accent-ink);
+      cursor: pointer;
+    }
+    button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+    button:disabled { opacity: 0.5; cursor: default; }
+    #transcript {
+      min-height: 220px;
+      max-height: 460px;
+      overflow: auto;
+      display: grid;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .bubble { padding: 8px 10px; border-radius: 8px; white-space: pre-wrap; word-break: break-word; }
+    .user { background: #e7f3ef; }
+    .assistant { background: #f3f0e8; }
+    .meta { color: var(--muted); font-size: 12px; }
+    #status { display: grid; grid-template-columns: 9em 1fr; gap: 4px 8px; margin: 0; }
+    #status dt { color: var(--muted); }
+    #status dd { margin: 0; word-break: break-all; }
+    #boot, #log { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+    #boot li, #log li {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--line);
+      font-variant-numeric: tabular-nums;
+    }
+    #log li { grid-template-columns: 1fr; font-size: 13px; }
+    #files { margin: 8px 0 0; padding: 0; list-style: none; display: grid; gap: 4px; max-height: 280px; overflow: auto; }
+    #files button { width: 100%; text-align: left; padding: 4px 8px; }
+    #file-path { flex: 1; min-width: 8em; }
+    .banner { margin: 8px 0 0; font-size: 13px; }
+    .banner.bad { color: var(--bad); }
+    .banner.warn { color: var(--warn); }
+    .banner.ok { color: var(--ok); }
+    @media (max-width: 860px) {
+      .layout { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>沙箱 agent 操作台</h1>
+    <p class="hint">页面不鉴权。Key 只留在这个标签页的 sessionStorage，适合本机操作，不要在公开页面使用。</p>
+  </header>
+  <div class="layout">
+    <main>
+      <section>
+        <div class="row">
+          <label>调用方 Key<input id="key" type="password" autocomplete="off" placeholder="未开鉴权可留空"></label>
+          <label>user_id<input id="user" autocomplete="off" value="demo"></label>
+          <button id="load" type="button">读取引擎</button>
+        </div>
+        <p id="conn-msg" class="banner"></p>
+      </section>
+      <section>
+        <div class="row">
+          <label>引擎<select id="engine"></select></label>
+          <button id="start" type="button">启动沙箱</button>
+          <button id="hibernate" class="ghost" type="button">休眠沙箱</button>
+          <button id="stop" class="ghost" type="button">停止沙箱</button>
+        </div>
+        <p id="boot-note" class="banner"></p>
+        <ul id="boot"></ul>
+      </section>
+      <section>
+        <div id="transcript"></div>
+        <form id="composer">
+          <textarea id="text" placeholder="发给 agent 的消息。启动完成后再发；第一条仍要建会话。"></textarea>
+          <div class="row" style="margin-top: 10px">
+            <button id="send" type="submit">发送</button>
+            <button id="abort" class="ghost" type="button" disabled>中止</button>
+          </div>
+        </form>
+      </section>
+    </main>
+    <aside>
+      <div>
+        <h2>沙箱</h2>
+        <dl id="status"></dl>
+      </div>
+      <div>
+        <h2>本轮工具与状态</h2>
+        <p class="hint">只保留这次连接里的 tool / status。刷新页面不会回放。</p>
+        <ul id="log"></ul>
+      </div>
+      <div>
+        <h2>沙箱文件</h2>
+        <p id="files-note" class="hint">先点「启动沙箱」。休眠或未运行时不读取文件。</p>
+        <div class="row">
+          <input id="file-path" type="text" value="/" aria-label="路径" spellcheck="false">
+          <button id="file-go" class="ghost" type="button">打开</button>
+          <button id="file-up" class="ghost" type="button">上级</button>
+        </div>
+        <ul id="files"></ul>
+        <label class="hint">上传到当前目录
+          <input id="file-upload" type="file" disabled>
+        </label>
+      </div>
+    </aside>
+  </div>
+  <script>
+    const STEP_LABEL = {
+      create: "创建沙箱",
+      password: "写入应用密码",
+      health: "等待进程健康",
+      files: "写入配置",
+      preload: "预加载",
+      activate: "记为运行中",
+    };
+    const $ = (id) => document.getElementById(id);
+    const keyInput = $("key");
+    const userInput = $("user");
+    const engineSelect = $("engine");
+    let sessionId = null;
+    let taskId = null;
+    let pollTimer = null;
+    let sawDone = false;
+    let filesActive = false;
+    let filePath = "/";
+    let fileSandboxId = null;
+    let fileGen = 0;
+
+    keyInput.value = sessionStorage.getItem("console.apiKey") || "";
+    userInput.value = sessionStorage.getItem("console.userId") || "demo";
+
+    function persist() {
+      sessionStorage.setItem("console.apiKey", keyInput.value);
+      sessionStorage.setItem("console.userId", userInput.value.trim() || "demo");
+    }
+    function headers(json) {
+      const h = {};
+      if (json) h["Content-Type"] = "application/json";
+      const key = keyInput.value.trim();
+      if (key) h.Authorization = "Bearer " + key;
+      return h;
+    }
+    function userId() {
+      return userInput.value.trim() || "demo";
+    }
+    function setBanner(id, text, kind) {
+      const el = $(id);
+      el.textContent = text || "";
+      el.className = "banner" + (kind ? " " + kind : "");
+    }
+    function fmtMs(ms) {
+      if (ms == null || Number.isNaN(ms)) return "—";
+      if (ms < 1000) return Math.round(ms) + " ms";
+      return (ms / 1000).toFixed(2) + " s";
+    }
+    function fmtTime(ts) {
+      if (ts == null) return "—";
+      return new Date(ts * 1000).toLocaleString();
+    }
+
+    async function readError(resp) {
+      try {
+        const body = await resp.json();
+        const attempts = Array.isArray(body.attempts) ? body.attempts : [];
+        const extra = attempts.map((item) => {
+          const steps = (item.steps || []).map((s) => s.name).join(" → ") || "还没有完成的步骤";
+          return (item.sandbox_row_id || "") + "：" + (item.error || "无错误说明") + "（" + steps + "）";
+        }).join("\n");
+        return (body.detail || body.error || resp.statusText) + (extra ? "\n" + extra : "");
+      } catch (e) {
+        return resp.statusText || String(resp.status);
+      }
+    }
+
+    async function loadEngines() {
+      persist();
+      setBanner("conn-msg", "正在读取引擎…");
+      const resp = await fetch("/v1/agent-engines", { headers: headers(false) });
+      if (!resp.ok) {
+        setBanner("conn-msg", await readError(resp), "bad");
+        return;
+      }
+      const body = await resp.json();
+      engineSelect.replaceChildren();
+      for (const item of body.engines || []) {
+        const opt = document.createElement("option");
+        opt.value = item.name;
+        opt.textContent = item.name + (item.default ? "（默认）" : "") + " · " + (item.model || "");
+        engineSelect.appendChild(opt);
+      }
+      const preferred = body.default;
+      if (preferred && [...engineSelect.options].some((opt) => opt.value === preferred)) {
+        engineSelect.value = preferred;
+      }
+      setBanner("conn-msg", "已读取 " + engineSelect.options.length + " 个引擎。", "ok");
+      await refreshStatus();
+    }
+
+    function renderBoot(boot, fresh) {
+      const list = $("boot");
+      list.replaceChildren();
+      if (!boot) return;
+      if (fresh === false) setBanner("boot-note", "这是已有沙箱的历史明细，不是这次点击新测出来的。", "warn");
+      else if (fresh === true) setBanner("boot-note", "本次启动完成。总耗时 " + fmtMs(boot.total_ms) + "。", "ok");
+      for (const step of boot.steps || []) {
+        const li = document.createElement("li");
+        const name = document.createElement("span");
+        name.textContent = (STEP_LABEL[step.name] || step.name);
+        const time = document.createElement("span");
+        time.textContent = fmtMs(step.duration_ms);
+        li.append(name, time);
+        list.appendChild(li);
+      }
+      if (boot.running) {
+        const li = document.createElement("li");
+        const name = document.createElement("span");
+        name.textContent = (STEP_LABEL[boot.running] || boot.running) + "（进行中）";
+        const time = document.createElement("span");
+        const steps = boot.steps || [];
+        const last = steps.length ? steps[steps.length - 1].finished_at : null;
+        const elapsed = last == null ? null : Math.max(0, Date.now() - last * 1000);
+        time.textContent = elapsed == null ? "…" : fmtMs(elapsed);
+        li.append(name, time);
+        list.appendChild(li);
+      } else if (boot.total_ms != null) {
+        const li = document.createElement("li");
+        const name = document.createElement("span");
+        name.textContent = "总耗时";
+        const time = document.createElement("span");
+        time.textContent = fmtMs(boot.total_ms);
+        li.append(name, time);
+        list.appendChild(li);
+      }
+    }
+
+    function renderStatus(info) {
+      const dl = $("status");
+      dl.replaceChildren();
+      const boxes = (info && info.sandboxes) || [];
+      const selected = engineSelect.value;
+      const row = boxes.find((item) => item.state === "ACTIVE" && item.engine === selected)
+        || boxes.find((item) => item.engine === selected)
+        || boxes.find((item) => item.state === "ACTIVE")
+        || boxes[0];
+      if (!row) $("boot").replaceChildren();
+      const fields = row ? [
+        ["状态", row.state],
+        ["引擎", row.engine],
+        ["模板", row.template],
+        ["硬截止", fmtTime(row.hard_deadline)],
+        ["健康失败", row.health_failures == null ? "—" : String(row.health_failures)],
+        ["错误", row.error || "—"],
+      ] : [["状态", "还没有沙箱"]];
+      for (const [k, v] of fields) {
+        const dt = document.createElement("dt");
+        dt.textContent = k;
+        const dd = document.createElement("dd");
+        dd.textContent = v == null ? "—" : String(v);
+        dl.append(dt, dd);
+      }
+      if (row && row.boot) renderBoot(row.boot, null);
+      syncFiles(row);
+    }
+
+    function parentPath(path) {
+      if (!path || path === "/") return "/";
+      const parts = path.replace(/\/+$/, "").split("/");
+      parts.pop();
+      return parts.join("/") || "/";
+    }
+
+    function joinPath(dir, name) {
+      const base = String(name || "").split(/[/\\]/).pop();
+      if (!base) return dir || "/";
+      if (!dir || dir === "/") return "/" + base;
+      return dir.replace(/\/$/, "") + "/" + base;
+    }
+
+    function syncFiles(row) {
+      const active = Boolean(row && row.state === "ACTIVE");
+      if (!active) {
+        fileGen += 1;
+        filesActive = false;
+        fileSandboxId = null;
+        $("files").replaceChildren();
+        $("file-upload").disabled = true;
+        $("files-note").textContent = "先点「启动沙箱」。休眠或未运行时不读取文件。";
+        return;
+      }
+      filesActive = true;
+      $("file-upload").disabled = false;
+      if (fileSandboxId !== row.id) {
+        fileSandboxId = row.id;
+        filePath = "/";
+        $("file-path").value = "/";
+      }
+      loadFiles(filePath).catch((e) => { $("files-note").textContent = String(e); });
+    }
+
+    async function loadFiles(path) {
+      if (!filesActive) {
+        syncFiles(null);
+        return;
+      }
+      const gen = ++fileGen;
+      const target = path || "/";
+      const resp = await fetch(
+        "/v1/agents/" + encodeURIComponent(userId()) + "/files?path=" + encodeURIComponent(target),
+        { headers: headers(false) }
+      );
+      if (gen !== fileGen || !filesActive) return;
+      if (!resp.ok) {
+        $("files-note").textContent = await readError(resp);
+        return;
+      }
+      const body = await resp.json();
+      if (gen !== fileGen || !filesActive) return;
+      filePath = body.path || target;
+      $("file-path").value = filePath;
+      $("files-note").textContent = filePath;
+      const list = $("files");
+      list.replaceChildren();
+      for (const entry of body.entries || []) {
+        const li = document.createElement("li");
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "ghost";
+        btn.textContent = entry.type === "dir" ? entry.name + "/" : entry.name + "  " + entry.size;
+        btn.addEventListener("click", () => {
+          const action = entry.type === "dir" ? loadFiles(entry.path) : downloadFile(entry.path, entry.name);
+          action.catch((e) => { $("files-note").textContent = String(e); });
+        });
+        li.append(btn);
+        list.appendChild(li);
+      }
+    }
+
+    async function downloadFile(path, name) {
+      if (!filesActive) return;
+      const resp = await fetch(
+        "/v1/agents/" + encodeURIComponent(userId()) + "/files/content?path=" + encodeURIComponent(path),
+        { headers: headers(false) }
+      );
+      if (!resp.ok) {
+        $("files-note").textContent = await readError(resp);
+        return;
+      }
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = name || "download";
+      link.click();
+      URL.revokeObjectURL(url);
+    }
+
+    async function uploadFile(file) {
+      if (!filesActive || !file) return;
+      const path = joinPath(filePath, file.name);
+      const resp = await fetch(
+        "/v1/agents/" + encodeURIComponent(userId()) + "/files?path=" + encodeURIComponent(path),
+        { method: "PUT", headers: headers(false), body: file }
+      );
+      if (!resp.ok) {
+        $("files-note").textContent = await readError(resp);
+        return;
+      }
+      await loadFiles(filePath);
+    }
+
+    async function refreshStatus() {
+      const resp = await fetch("/v1/agents/" + encodeURIComponent(userId()), { headers: headers(false) });
+      if (resp.status === 404) {
+        renderStatus(null);
+        return;
+      }
+      if (!resp.ok) return;
+      renderStatus(await resp.json());
+    }
+
+    function stopPoll() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = null;
+    }
+
+    async function startSandbox() {
+      persist();
+      sessionId = null;
+      setBanner("boot-note", "正在启动…");
+      $("start").disabled = true;
+      stopPoll();
+      pollTimer = setInterval(() => { refreshStatus().catch(() => {}); }, 1000);
+      try {
+        const resp = await fetch("/v1/agents/" + encodeURIComponent(userId()) + "/sandbox", {
+          method: "POST",
+          headers: headers(true),
+          body: JSON.stringify({ engine: engineSelect.value || null }),
+        });
+        if (!resp.ok) {
+          setBanner("boot-note", await readError(resp), "bad");
+          return;
+        }
+        const body = await resp.json();
+        renderBoot(body.boot, body.resumed ? null : body.fresh);
+        if (body.resumed) setBanner("boot-note", "沙箱已唤醒。", "ok");
+        renderStatus({ sandboxes: [body.sandbox] });
+      } finally {
+        stopPoll();
+        $("start").disabled = false;
+        refreshStatus().catch(() => {});
+      }
+    }
+
+    async function hibernateSandbox() {
+      persist();
+      const resp = await fetch("/v1/agents/" + encodeURIComponent(userId()) + "/sandbox/pause", {
+        method: "POST",
+        headers: headers(false),
+      });
+      if (!resp.ok) {
+        setBanner("boot-note", await readError(resp), "bad");
+        return;
+      }
+      setBanner("boot-note", "沙箱已休眠。下次启动或发消息会唤醒，会话还在。", "ok");
+      await refreshStatus();
+    }
+
+    async function stopSandbox() {
+      persist();
+      const resp = await fetch("/v1/agents/" + encodeURIComponent(userId()) + "/sandbox", {
+        method: "DELETE",
+        headers: headers(false),
+      });
+      sessionId = null;
+      taskId = null;
+      if (!resp.ok && resp.status !== 404) {
+        setBanner("boot-note", await readError(resp), "bad");
+        return;
+      }
+      setBanner("boot-note", "沙箱已停止。下次启动会新建一台，原来的会话不能续。", "warn");
+      $("boot").replaceChildren();
+      await refreshStatus();
+    }
+
+    function addBubble(role, text) {
+      const div = document.createElement("div");
+      div.className = "bubble " + role;
+      div.textContent = text;
+      $("transcript").appendChild(div);
+      div.scrollIntoView({ block: "nearest" });
+      return div;
+    }
+
+    function addLog(line) {
+      const li = document.createElement("li");
+      li.textContent = line;
+      $("log").appendChild(li);
+    }
+
+    function onSse(kind, data) {
+      if (kind === "start") {
+        taskId = data.task_id || taskId;
+        sessionId = data.session_id || sessionId;
+        addLog("start " + (data.task_id || ""));
+      } else if (kind === "text") {
+        const last = $("transcript").lastElementChild;
+        if (!last || !last.classList.contains("assistant")) addBubble("assistant", "");
+        $("transcript").lastElementChild.textContent += data.delta || "";
+      } else if (kind === "tool") {
+        const bits = [data.tool || "tool", data.status || ""];
+        if (data.title) bits.push(data.title);
+        if (data.error) bits.push(data.error);
+        else if (data.output) bits.push(data.output);
+        addLog(bits.filter(Boolean).join(" · "));
+      } else if (kind === "status") {
+        addLog("status " + (data.type || "") + (data.message ? " · " + data.message : ""));
+      } else if (kind === "done") {
+        sawDone = true;
+        taskId = data.task_id || taskId;
+        sessionId = data.session_id || sessionId;
+        const line = "done " + (data.state || "");
+        addLog(line + (data.error ? " · " + data.error : ""));
+        const note = document.createElement("div");
+        note.className = "meta";
+        note.textContent = line + (data.result ? "" : "（没有最终文本）");
+        $("transcript").appendChild(note);
+      }
+    }
+
+    async function readSse(resp) {
+      const reader = resp.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let cut;
+        while ((cut = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, cut);
+          buf = buf.slice(cut + 2);
+          if (!block.trim() || block.startsWith(":")) continue;
+          let kind = null;
+          const data = [];
+          for (const line of block.split("\n")) {
+            if (line.startsWith("event:")) kind = line.slice(6).trim();
+            else if (line.startsWith("data:")) data.push(line.slice(5).trim());
+          }
+          if (kind && data.length) onSse(kind, JSON.parse(data.join("\n")));
+        }
+      }
+    }
+
+    async function sendMessageReal(text) {
+      persist();
+      sawDone = false;
+      taskId = null;
+      $("log").replaceChildren();
+      addBubble("user", text);
+      $("send").disabled = true;
+      $("abort").disabled = false;
+      const payload = { text, stream: true };
+      if (sessionId) payload.session_id = sessionId;
+      try {
+        const resp = await fetch("/v1/agents/" + encodeURIComponent(userId()) + "/messages", {
+          method: "POST",
+          headers: headers(true),
+          body: JSON.stringify(payload),
+        });
+        if (!resp.ok) {
+          addBubble("assistant", await readError(resp));
+          return;
+        }
+        await readSse(resp);
+        if (!sawDone && taskId) {
+          addLog("连接中断，改为跟随任务");
+          const again = await fetch(
+            "/v1/agents/" + encodeURIComponent(userId()) + "/tasks/" + encodeURIComponent(taskId) + "/stream",
+            { headers: headers(false) }
+          );
+          if (again.ok) await readSse(again);
+        }
+      } finally {
+        $("send").disabled = false;
+        $("abort").disabled = !taskId || sawDone;
+        refreshStatus().catch(() => {});
+      }
+    }
+
+    async function abortTask() {
+      if (!taskId) return;
+      const resp = await fetch(
+        "/v1/agents/" + encodeURIComponent(userId()) + "/tasks/" + encodeURIComponent(taskId) + "/abort",
+        { method: "POST", headers: headers(false) }
+      );
+      if (!resp.ok) {
+        setBanner("boot-note", await readError(resp), "bad");
+        return;
+      }
+      const body = await resp.json();
+      addLog("abort " + (body.state || ""));
+    }
+
+    $("load").addEventListener("click", () => { loadEngines().catch((e) => setBanner("conn-msg", String(e), "bad")); });
+    $("start").addEventListener("click", () => { startSandbox().catch((e) => setBanner("boot-note", String(e), "bad")); });
+    $("hibernate").addEventListener("click", () => { hibernateSandbox().catch((e) => setBanner("boot-note", String(e), "bad")); });
+    $("stop").addEventListener("click", () => { stopSandbox().catch((e) => setBanner("boot-note", String(e), "bad")); });
+    engineSelect.addEventListener("change", () => { sessionId = null; });
+    $("composer").addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      const text = $("text").value.trim();
+      if (!text) return;
+      $("text").value = "";
+      sendMessageReal(text).catch((e) => addBubble("assistant", String(e)));
+    });
+    $("abort").addEventListener("click", () => { abortTask().catch((e) => setBanner("boot-note", String(e), "bad")); });
+    $("file-go").addEventListener("click", () => {
+      loadFiles($("file-path").value.trim() || "/").catch((e) => { $("files-note").textContent = String(e); });
+    });
+    $("file-up").addEventListener("click", () => {
+      loadFiles(parentPath(filePath)).catch((e) => { $("files-note").textContent = String(e); });
+    });
+    $("file-upload").addEventListener("change", () => {
+      const file = $("file-upload").files && $("file-upload").files[0];
+      $("file-upload").value = "";
+      if (file) uploadFile(file).catch((e) => { $("files-note").textContent = String(e); });
+    });
+    loadEngines().catch((e) => setBanner("conn-msg", String(e), "bad"));
+  </script>
+</body>
+</html>

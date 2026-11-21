@@ -23,12 +23,14 @@ import httpcore
 import httpx
 from e2b import NotFoundException, SandboxQuery, TimeoutException
 from e2b.sandbox.commands.command_handle import CommandExitException
+from e2b.sandbox.filesystem.filesystem import FileType
 from e2b_code_interpreter import AsyncSandbox
 
 from sandbox_pool.provider.base import (
     AppSandbox,
     CodeResult,
     CommandResult,
+    DirEntry,
     ExecutionTimeout,
     OutputCap,
     ProviderSandbox,
@@ -175,6 +177,33 @@ class HandleCache:
             del self._locks[key]
 
 
+def _direct_entries(path: str, entries) -> list[DirEntry]:
+    """只保留请求目录的直接子项。SDK 标不成文件或目录的项不出现。"""
+    parent = "/" if path == "/" else path.rstrip("/")
+    found: dict[str, DirEntry] = {}
+    for entry in entries:
+        ftype = entry.type.value if getattr(entry, "type", None) is not None else None
+        if ftype not in ("file", "dir"):
+            continue
+        full = entry.path or ""
+        name = entry.name or ""
+        if parent == "/":
+            rel = full[1:] if full.startswith("/") else full
+        elif full.startswith(parent + "/"):
+            rel = full[len(parent) + 1:]
+        else:
+            rel = name if name and "/" not in name else ""
+        if not rel or "/" in rel:
+            continue
+        child = "/" + rel if parent == "/" else parent + "/" + rel
+        size = int(entry.size or 0)
+        current = found.get(rel)
+        if current is not None and current.type == "dir":
+            continue
+        found[rel] = DirEntry(rel, child, ftype, 0 if ftype == "dir" else size)
+    return list(found.values())
+
+
 class E2BProvider:
     def __init__(
         self,
@@ -312,10 +341,7 @@ class E2BProvider:
             return None
         return getattr(info.state, "value", str(info.state))
 
-    async def list(self, metadata: dict[str, str]) -> list[ProviderSandbox]:
-        paginator = AsyncSandbox.list(
-            query=SandboxQuery(metadata=metadata), request_timeout=_API_TIMEOUT, **self._opts
-        )
+    async def _collect(self, paginator) -> list[ProviderSandbox]:
         out: list[ProviderSandbox] = []
         while paginator.has_next:
             for info in await _retry_stale(paginator.next_items):
@@ -328,6 +354,17 @@ class E2BProvider:
                     )
                 )
         return out
+
+    async def list(self, metadata: dict[str, str]) -> list[ProviderSandbox]:
+        paginator = AsyncSandbox.list(
+            query=SandboxQuery(metadata=metadata), request_timeout=_API_TIMEOUT, **self._opts
+        )
+        return await self._collect(paginator)
+
+    async def list_account(self) -> "list[ProviderSandbox]":
+        """不传 SandboxQuery：平台默认同时返回 running 和 paused。"""
+        paginator = AsyncSandbox.list(request_timeout=_API_TIMEOUT, **self._opts)
+        return await self._collect(paginator)
 
     async def run_code(self, sandbox_id, code, *, language, timeout_s, sandbox_timeout_s,
                        max_output_bytes: int = 256 * 1024) -> CodeResult:
@@ -398,16 +435,64 @@ class E2BProvider:
                 ) from e
             raise
 
+    async def _retry_file_op(self, action, detail: str):
+        """幂等的 envd 文件调用。连接类错误按写入配置的间隔重试，超时不重试。
+
+        action 每次调用都要产生新的可等待对象。本机代理下到沙箱子域名的新连接会偶发失败。
+        """
+        for delay in (*_WRITE_RETRY_DELAYS, None):
+            try:
+                return await action()
+            except _WRITE_RETRY_ERRORS as e:
+                if delay is None:
+                    raise
+                log.info("%s failed (%r), retrying in %.1fs", detail, e, delay)
+                await asyncio.sleep(delay)
+
+    async def _stat_entry(self, handle, path: str):
+        try:
+            return await self._retry_file_op(
+                lambda: handle.files.get_info(path, request_timeout=_API_TIMEOUT),
+                f"stat {path}",
+            )
+        except NotFoundException as e:
+            raise FileNotFoundError(path) from e
+
     async def write_file(self, sandbox_id, path, data, *, sandbox_timeout_s) -> None:
         h = await self._handle(sandbox_id, sandbox_timeout_s)
-        await h.files.write(path, data)
+        await self._retry_file_op(
+            lambda: h.files.write(path, data, request_timeout=_API_TIMEOUT),
+            f"write {path} to {sandbox_id}",
+        )
 
     async def read_file(self, sandbox_id, path, *, sandbox_timeout_s) -> bytes:
         h = await self._handle(sandbox_id, sandbox_timeout_s)
+        info = await self._stat_entry(h, path)
+        if info.type == FileType.DIR:
+            raise IsADirectoryError(path)
         try:
-            return bytes(await h.files.read(path, format="bytes"))
+            data = await self._retry_file_op(
+                lambda: h.files.read(path, format="bytes", request_timeout=_API_TIMEOUT),
+                f"read {path} from {sandbox_id}",
+            )
         except NotFoundException as e:
             raise FileNotFoundError(path) from e
+        return bytes(data)
+
+    async def list_dir(self, sandbox_id: str, path: str, *, sandbox_timeout_s: float) -> "list[DirEntry]":
+        h = await self._handle(sandbox_id, sandbox_timeout_s)
+        if path != "/":
+            info = await self._stat_entry(h, path)
+            if info.type == FileType.FILE:
+                raise NotADirectoryError(path)
+        try:
+            entries = await self._retry_file_op(
+                lambda: h.files.list(path, depth=1, request_timeout=_API_TIMEOUT),
+                f"list {path} in {sandbox_id}",
+            )
+        except NotFoundException as e:
+            raise FileNotFoundError(path) from e
+        return _direct_entries(path, entries)
 
     async def close(self) -> None:
         self._cache.clear()
@@ -453,15 +538,10 @@ class E2BProvider:
         h = await self._handle(sandbox_id, sandbox_timeout_s)
         for path, data in files.items():
             # 写文件是幂等的：连接类错误（刚创建时 envd 短暂不可达；本机代理 fake-ip 下新连接约 1/3 失败，实测）多重试几次
-            for delay in (*_WRITE_RETRY_DELAYS, None):
-                try:
-                    await h.files.write(path, data, request_timeout=_API_TIMEOUT)
-                    break
-                except _WRITE_RETRY_ERRORS as e:
-                    if delay is None:
-                        raise
-                    log.info("write %s to %s failed (%r), retrying in %.1fs", path, sandbox_id, e, delay)
-                    await asyncio.sleep(delay)
+            await self._retry_file_op(
+                lambda path=path, data=data: h.files.write(path, data, request_timeout=_API_TIMEOUT),
+                f"write {path} to {sandbox_id}",
+            )
 
     def app_client(self, endpoint, access_token, directory, *, ingress_ip, protocol="opencode"):
         if protocol == "opencode2":

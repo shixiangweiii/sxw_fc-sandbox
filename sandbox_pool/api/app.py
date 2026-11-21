@@ -1,8 +1,9 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from sandbox_pool.api.agent_routes import router as agent_router
 from sandbox_pool.api.auth import Authenticator
@@ -30,6 +31,9 @@ from sandbox_pool.models import (
     WaitTimeout,
 )
 from sandbox_pool.provider.base import SandboxProvider
+
+_CONSOLE_PAGE = Path(__file__).resolve().parent.parent / "web" / "index.html"
+_ADMIN_PAGE = Path(__file__).resolve().parent.parent / "web" / "admin.html"
 
 _STATUS = {
     InvalidRequest: 400,
@@ -101,6 +105,16 @@ def create_app(
         app.state.pool = pool
     app.include_router(router)
     app.include_router(agent_router)
+
+    @app.get("/console", include_in_schema=False)
+    async def console_page():
+        """本机操作台。页面本身不鉴权，页面里的接口调用仍要 Bearer。"""
+        return FileResponse(_CONSOLE_PAGE)
+
+    @app.get("/admin", include_in_schema=False)
+    async def admin_page():
+        """沙箱实例管理页。页面本身不鉴权，接口要管理员 Key。"""
+        return FileResponse(_ADMIN_PAGE)
     app.add_middleware(BodyLimitMiddleware, max_body_bytes=config.max_body_bytes)
 
     @app.exception_handler(BodyTooLarge)

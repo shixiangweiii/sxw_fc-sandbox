@@ -1,7 +1,7 @@
 """沙箱后端抽象。池子只依赖这里的接口，便于替换后端和用 Fake 测试。"""
 
 from dataclasses import dataclass, field
-from typing import Optional, Protocol
+from typing import List, Optional, Protocol
 
 
 class SandboxNotFound(Exception):
@@ -74,6 +74,16 @@ class ProviderSandbox:
 
 
 @dataclass
+class DirEntry:
+    """一层目录中的一项。type 为 file 或 dir。"""
+
+    name: str
+    path: str
+    type: str
+    size: int
+
+
+@dataclass
 class AppSandbox:
     """对外提供服务的沙箱（agent 子系统）：服务地址与访问它必带的平台流量令牌。"""
 
@@ -138,6 +148,9 @@ class SandboxProvider(Protocol):
 
     async def list(self, metadata: dict[str, str]) -> list[ProviderSandbox]: ...
 
+    async def list_account(self) -> List[ProviderSandbox]:
+        """当前账号、当前地域的全部沙箱，含 running 与 paused。不按 metadata 过滤，不续期、不恢复。"""
+
     async def run_code(
         self,
         sandbox_id: str,
@@ -164,6 +177,12 @@ class SandboxProvider(Protocol):
     async def write_file(self, sandbox_id: str, path: str, data: bytes, *, sandbox_timeout_s: float) -> None: ...
 
     async def read_file(self, sandbox_id: str, path: str, *, sandbox_timeout_s: float) -> bytes: ...
+
+    async def list_dir(self, sandbox_id: str, path: str, *, sandbox_timeout_s: float) -> List[DirEntry]:
+        """列出目录的直接子项。路径不存在抛 FileNotFoundError，路径是文件抛 NotADirectoryError。
+
+        读取目录当文件时，read_file 抛 IsADirectoryError。需要重新连接时按 sandbox_timeout_s 设置平台超时。
+        """
 
     def forget(self, sandbox_id: str) -> None:
         """丢弃本副本为该沙箱缓存的连接（借用已结束等场景）。"""

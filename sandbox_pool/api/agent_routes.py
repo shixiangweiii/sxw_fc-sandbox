@@ -10,12 +10,13 @@ import json
 from typing import AsyncIterator, Optional
 
 from fastapi import APIRouter, Body, Depends, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from sandbox_pool.agent.service import AgentService
 from sandbox_pool.api.auth import Caller, require_admin, require_caller
-from sandbox_pool.api.schemas import MessageRequest, ScheduleIn, SchedulePatch, TaskOut
-from sandbox_pool.models import AgentUnavailable
+from sandbox_pool.api.routes import _read_body
+from sandbox_pool.api.schemas import MessageRequest, ScheduleIn, SchedulePatch, StartSandboxRequest, TaskOut
+from sandbox_pool.models import AgentUnavailable, SandboxOpError
 
 router = APIRouter(prefix="/v1")
 
@@ -111,10 +112,65 @@ async def patch_settings(user_id: str, request: Request, body: dict = Body(...),
     return await svc.update_settings(agent, body)
 
 
+@router.post("/agents/{user_id}/sandbox")
+async def start_sandbox(
+    user_id: str,
+    request: Request,
+    body: Optional[StartSandboxRequest] = Body(None),
+    caller: Caller = Depends(require_caller),
+):
+    """确保沙箱为 ACTIVE。不建会话。装配失败时 502，并带上每次尝试已经完成的步骤。"""
+    svc = _svc(request)
+    agent = await svc.ensure_agent(caller.name, user_id)
+    try:
+        return await svc.start_sandbox(agent, engine=body.engine if body else None)
+    except SandboxOpError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={"error": "SandboxOpError", "detail": str(exc), "attempts": exc.attempts},
+        )
+
+
+@router.post("/agents/{user_id}/sandbox/pause")
+async def pause_agent_sandbox(user_id: str, request: Request, caller: Caller = Depends(require_caller)):
+    """休眠该用户当前的沙箱。有运行中任务时返回 409。再次启动或发消息会唤醒。"""
+    svc = _svc(request)
+    return await svc.pause_sandbox(await svc.get_agent(caller.name, user_id))
+
+
 @router.delete("/agents/{user_id}/sandbox")
 async def reset_sandbox(user_id: str, request: Request, caller: Caller = Depends(require_caller)):
     svc = _svc(request)
     return await svc.reset(await svc.get_agent(caller.name, user_id))
+
+
+@router.get("/agents/{user_id}/files")
+async def list_sandbox_files(
+    user_id: str, request: Request, path: str = Query("/"), caller: Caller = Depends(require_caller),
+):
+    """列出当前 ACTIVE 沙箱的一层目录。path 省略时为根目录。"""
+    svc = _svc(request)
+    return await svc.list_files(await svc.get_agent(caller.name, user_id), path)
+
+
+@router.get("/agents/{user_id}/files/content")
+async def download_sandbox_file(
+    user_id: str, request: Request, path: str = Query(...), caller: Caller = Depends(require_caller),
+):
+    """下载一个文件，响应体是原始字节。"""
+    svc = _svc(request)
+    _path, data = await svc.read_file(await svc.get_agent(caller.name, user_id), path)
+    return Response(content=data, media_type="application/octet-stream")
+
+
+@router.put("/agents/{user_id}/files")
+async def upload_sandbox_file(
+    user_id: str, request: Request, path: str = Query(...), caller: Caller = Depends(require_caller),
+):
+    """把请求体覆盖写入绝对路径。超过 max_upload_bytes 返回 413。"""
+    svc = _svc(request)
+    data = await _read_body(request, svc.cfg.max_upload_bytes)
+    return await svc.write_file(await svc.get_agent(caller.name, user_id), path, data)
 
 
 @router.get("/agents/{user_id}/egress")

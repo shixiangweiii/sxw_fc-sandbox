@@ -190,4 +190,5 @@ events = Table(
     Column("detail", Text),
     Index("ix_events_pool_kind", "pool", "kind"),
     Index("ix_events_pool_ts", "pool", "ts"),
+    Index("ix_events_pool_sandbox", "pool", "sandbox_row_id"),
 )

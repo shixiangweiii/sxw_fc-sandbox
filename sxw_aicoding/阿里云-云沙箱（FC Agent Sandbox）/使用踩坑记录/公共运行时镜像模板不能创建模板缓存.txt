@@ -1,0 +1,18 @@
+日期：2026-11-21
+
+问题：管理页对模板点「新建缓存」失败。`GET /v1/admin/template-caches` 返回 200，`POST /v1/admin/template-caches` 返回 500。
+
+平台返回（请求号 `01A1FE72-420C-51A0-90F1-5F1174F72F53`）：
+
+```
+Error: InvalidParameter code: 400
+micro-sandbox templates using public runtime images are not supported for template cache creation (public images are preheated by the platform)
+```
+
+原因：`CreateTemplateCache` 不接受「使用公共运行时镜像」的模板。这类镜像由平台自己预热，不能再通过这个接口建缓存。
+
+本仓库的模板是 `CreateTemplate` 做出来的自定义模板，但基础镜像是公共运行时镜像 `fc-e2b-registry.<地域>.cr.aliyuncs.com/runtime/code-interpreter-v1:v0.0.52`（见 `scripts/build_opencode_template.py`、`scripts/build_pi_template.py`、`scripts/build_agent_research_template.py`、`scripts/build_pyagent_template.py`）。所以对它们调用新建缓存会被平台拒绝。
+
+管理页显示成 500，是因为这段平台 400 没有被接住，异常直接冒到了 ASGI。凭证和列表查询是通的，不是鉴权或网络问题。
+
+结论：这些基于公共运行时镜像的模板不要建模板缓存。页面上的 500 只是把平台的 400 原样漏了出来。

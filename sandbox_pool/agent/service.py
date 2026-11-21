@@ -7,6 +7,7 @@
 import asyncio
 import json
 import logging
+import posixpath
 import time
 import uuid
 from typing import AsyncIterator, Optional
@@ -35,7 +36,9 @@ from sandbox_pool.models import (
     AgentNotFound,
     AgentUnavailable,
     InvalidRequest,
+    SandboxBusy,
     SandboxOpError,
+    SandboxRecordNotFound,
     SandboxState,
     TaskConflict,
     TaskState,
@@ -59,6 +62,53 @@ _RELOAD_POLL_S = 0.2
 # 跟随其他副本上的任务（断线重连）时多久读一次库，看任务是否已结束
 _FOLLOW_POLL_S = 1.0
 MIN_EVERY_S = 60
+
+# 装配耗时：事件 kind → 对外步骤名。agent_create / agent_boot 是原有事件，其余是分步。
+_BOOT_STEP_KINDS = {
+    "agent_create": "create",
+    "agent_boot_password": "password",
+    "agent_boot_health": "health",
+    "agent_boot_files": "files",
+    "agent_boot_preload": "preload",
+    "agent_boot_activate": "activate",
+}
+BOOT_EVENT_KINDS = tuple(_BOOT_STEP_KINDS) + ("agent_boot", "agent_boot_failed")
+
+
+def boot_step_order(engine: str) -> tuple[str, ...]:
+    """连续分段的顺序。opencode2 在创建之后多写一次应用密码。"""
+    if engine == "opencode2":
+        return ("create", "password", "health", "files", "preload", "activate")
+    return ("create", "health", "files", "preload", "activate")
+
+
+def boot_view(events: list[dict], *, state: str, engine: str) -> dict:
+    """把装配事件收成对外的 boot：已完成步骤、总耗时、正在进行的下一步。
+
+    步骤按引擎顺序取，中间缺一段就停。进行中的那一步不在事件里。
+    ACTIVE 且已有 agent_boot 时 running 为空。
+    """
+    by_name: dict[str, dict] = {}
+    total = None
+    for ev in events:
+        kind = ev.get("kind")
+        if kind == "agent_boot":
+            total = ev.get("duration_ms")
+            continue
+        name = _BOOT_STEP_KINDS.get(kind or "")
+        if name and name not in by_name:
+            by_name[name] = ev
+    order = boot_step_order(engine)
+    steps = []
+    for name in order:
+        ev = by_name.get(name)
+        if ev is None:
+            break
+        steps.append({"name": name, "duration_ms": ev.get("duration_ms"), "finished_at": ev.get("ts")})
+    running = None
+    if not (state == SandboxState.ACTIVE.value and total is not None) and len(steps) < len(order):
+        running = order[len(steps)]
+    return {"total_ms": total, "steps": steps, "running": running}
 
 
 def check_agent_config(cfg: PoolConfig) -> None:
@@ -140,6 +190,7 @@ class AgentService:
         self._runner_tasks: set[asyncio.Task] = set()
         self._clients: dict[str, object] = {}
         self._boot_errors: dict[str, str] = {}
+        self._just_resumed: set[str] = set()
         # 停机中：维护循环不再接管任务、不再触发定时任务
         self.stopping = False
 
@@ -274,6 +325,14 @@ class AgentService:
     async def agent_info(self, agent: dict) -> dict:
         rows = await self.store.agent_sandboxes(agent["id"])
         running = await self.store.running_tasks(agent_id=agent["id"])
+        grouped = await self.store.events_for_sandboxes([r["id"] for r in rows], BOOT_EVENT_KINDS)
+        sandboxes = []
+        for row in rows:
+            view = sandbox_view(row, self.cfg)
+            view["boot"] = boot_view(
+                grouped.get(row["id"], []), state=row["state"], engine=view["engine"]
+            )
+            sandboxes.append(view)
         return {
             "user_id": agent["user_id"],
             "agent_id": agent["id"],
@@ -283,7 +342,7 @@ class AgentService:
             # 当前生效的引擎（设置为空时是默认引擎）
             "engine": self.agent_engine(agent).name,
             "egress_override": agent.get("egress"),
-            "sandboxes": [sandbox_view(r, self.cfg) for r in rows],
+            "sandboxes": sandboxes,
             "running_tasks": [t["id"] for t in running],
         }
 
@@ -301,6 +360,50 @@ class AgentService:
         self.maintainer.kick()
         return await self.agent_info(await self.store.get_agent_by_id(agent["id"]))
 
+    async def start_sandbox(self, agent: dict, *, engine: Optional[str] = None) -> dict:
+        """把该 agent 的沙箱做到 ACTIVE 再返回。不建会话、不发消息。
+
+        带 engine 且与已保存的值不同时先改设置。已经是同引擎的 ACTIVE 时直接返回，fresh 为 false。
+        """
+        started = self.now()
+        if engine is not None and (agent.get("settings") or {}).get("engine") != engine:
+            await self.update_settings(agent, {"engine": engine})
+            agent = await self.store.get_agent_by_id(agent["id"]) or agent
+        try:
+            row = await self.sandbox_for(agent)
+        except SandboxOpError as exc:
+            exc.attempts = await self.boot_attempt_views(exc.attempt_ids, self.agent_engine(agent).name)
+            raise
+        events = (await self.store.events_for_sandboxes(
+            [row["id"]], BOOT_EVENT_KINDS + ("agent_resume",)
+        )).get(row["id"], [])
+        boot = boot_view(events, state=row["state"], engine=row.get("engine") or LEGACY_ENGINE)
+        boot_ts = next((ev["ts"] for ev in events if ev["kind"] == "agent_boot"), None)
+        resumed = bool(row.pop("_resumed", False))
+        view = sandbox_view(row, self.cfg)
+        view["boot"] = boot
+        return {
+            "fresh": boot_ts is not None and boot_ts >= started,
+            "resumed": resumed,
+            "sandbox": view,
+            "boot": boot,
+        }
+
+    async def boot_attempt_views(self, row_ids: list[str], engine: str) -> list[dict]:
+        """失败尝试：沙箱行可能已经删掉，步骤和错误从事件里读。"""
+        grouped = await self.store.events_for_sandboxes(row_ids, BOOT_EVENT_KINDS)
+        out = []
+        for row_id in row_ids:
+            evs = grouped.get(row_id, [])
+            failed = next((ev for ev in evs if ev["kind"] == "agent_boot_failed"), None)
+            view = boot_view(evs, state=SandboxState.CREATING.value, engine=engine)
+            out.append({
+                "sandbox_row_id": row_id,
+                "steps": view["steps"],
+                "error": None if failed is None else failed.get("detail"),
+            })
+        return out
+
     # ---------- 沙箱 ----------
 
     async def sandbox_for(self, agent: dict, *, min_remaining_s: float = 0, wait_s: Optional[float] = None) -> dict:
@@ -314,9 +417,18 @@ class AgentService:
         # 新沙箱至少要能满足要求，否则每个沙箱都会被判为剩余寿命不足
         min_remaining_s = min(min_remaining_s, self.cfg.agent_max_life_s * 0.9)
         attempts = 0
+        # 本次创建或等到过的沙箱行。失败时交给启动接口，行删掉后事件还在。
+        seen: list[str] = []
+
+        def note(row_id: Optional[str]) -> None:
+            if row_id and row_id not in seen:
+                seen.append(row_id)
+
         while True:
             now = self.now()
-            rows = await self.store.agent_sandboxes(agent["id"], BOUND_STATES)
+            rows = await self.store.agent_sandboxes(
+                agent["id"], (*BOUND_STATES, SandboxState.PAUSED, SandboxState.PAUSING, SandboxState.RESUMING)
+            )
             active = [r for r in rows if r["state"] == SandboxState.ACTIVE.value]
             if active:
                 row = active[0]
@@ -340,11 +452,27 @@ class AgentService:
                         log.info("sandbox %s retiring: remaining life < %ss", row["provider_id"], min_remaining_s)
                         await self.lc.event("agent_retire", sandbox_row_id=row["id"], detail="remaining life too short")
                     continue
+                if row["id"] in self._just_resumed:
+                    self._just_resumed.discard(row["id"])
+                    row = {**row, "_resumed": True}
                 return row
+            paused = [r for r in rows if r["state"] == SandboxState.PAUSED.value]
+            if paused and not any(r["state"] == SandboxState.RESUMING.value for r in rows):
+                row = paused[0]
+                agent = await self.store.get_agent_by_id(agent["id"]) or agent
+                engine = self.agent_engine(agent)
+                if self.engine_for(row).name != engine.name or (
+                    min_remaining_s and self.hard_deadline(row) - now < min_remaining_s
+                ):
+                    await self.lc.destroy(row, "paused sandbox cannot take the next task")
+                    continue
+                await self._resume_one(row)
+                continue
             if not rows:
                 if attempts >= _MAX_BOOT_ATTEMPTS:
                     raise SandboxOpError(
-                        f"agent sandbox failed to start {attempts} times: {self._boot_errors.get(agent['id'], 'unknown')}"
+                        f"agent sandbox failed to start {attempts} times: {self._boot_errors.get(agent['id'], 'unknown')}",
+                        attempt_ids=seen,
                     )
                 # 建沙箱按库里最新的引擎设置（同上，PI-L1）
                 agent = await self.store.get_agent_by_id(agent["id"]) or agent
@@ -362,15 +490,109 @@ class AgentService:
                     raise AgentUnavailable(f"agent sandbox capacity reached ({self.cfg.agent_max_sandboxes})")
                 if status == "created":
                     attempts += 1
+                    note(row["id"])
                     self.lc.spawn(self._boot(row, agent))
+                elif status == "exists" and row is not None:
+                    note(row["id"])
+            else:
+                for item in rows:
+                    note(item["id"])
             if now >= deadline:
                 raise WaitTimeout(f"agent sandbox not ready within {wait_s:.0f}s")
             await asyncio.sleep(_SANDBOX_POLL_S)
 
+    async def pause_sandbox(self, agent: dict) -> dict:
+        """把该用户当前的 ACTIVE 沙箱休眠。有运行中任务时不暂停。已经休眠则原样返回。"""
+        rows = await self.store.agent_sandboxes(agent["id"], [SandboxState.ACTIVE, SandboxState.PAUSED])
+        paused = [r for r in rows if r["state"] == SandboxState.PAUSED.value]
+        active = [r for r in rows if r["state"] == SandboxState.ACTIVE.value]
+        if not active:
+            if paused:
+                return {"id": paused[0]["id"], "provider_id": paused[0].get("provider_id"), "state": "PAUSED", "changed": False}
+            raise AgentNotFound(f"agent {agent['user_id']} has no sandbox to pause")
+        row = active[0]
+        if await self.store.running_tasks(sandbox_row_id=row["id"]):
+            raise TaskConflict("sandbox has a running task; wait or abort it before pausing")
+        now = self.now()
+        if not await self.store.cas_sandbox(
+            row["id"], [SandboxState.ACTIVE], now=now, expect_version=row["version"],
+            state=SandboxState.PAUSING, op_owner=self.replica_id, op_deadline=now + self.cfg.resume_timeout_s,
+        ):
+            raise SandboxBusy(f"sandbox {row['id']} changed, retry later")
+        try:
+            await self.provider.pause(row["provider_id"])
+        except Exception as e:  # noqa: BLE001
+            fresh = await self.store.get_sandbox(row["id"])
+            if fresh and fresh["state"] == SandboxState.PAUSING.value and fresh["op_owner"] == self.replica_id:
+                actual = None
+                try:
+                    actual = await self.provider.get_state(row["provider_id"])
+                except Exception:  # noqa: BLE001
+                    actual = None
+                if actual == "paused":
+                    await self._mark_paused(fresh)
+                    return {"id": row["id"], "provider_id": row.get("provider_id"), "state": "PAUSED", "changed": True}
+                await self.lc.destroy(fresh, f"pause failed: {e}")
+            raise SandboxOpError(f"pause failed: {e}") from e
+        fresh = await self.store.get_sandbox(row["id"])
+        if fresh is None or not await self._mark_paused(fresh):
+            raise SandboxOpError(f"pause failed for sandbox {row['id']}")
+        return {"id": row["id"], "provider_id": row.get("provider_id"), "state": "PAUSED", "changed": True}
+
+    async def _mark_paused(self, row: dict) -> bool:
+        now = self.now()
+        ok = await self.store.cas_sandbox(
+            row["id"], [SandboxState.PAUSING], now=now, expect_owner=self.replica_id,
+            state=SandboxState.PAUSED, op_owner=None, op_deadline=None,
+        )
+        if ok:
+            await self.forget_client(row["id"])
+            await self.lc.event("agent_pause", sandbox_row_id=row["id"])
+        return ok
+
+    async def _resume_one(self, row: dict) -> None:
+        """PAUSED → RESUMING → ACTIVE。失败时销毁，避免卡在过渡态。"""
+        now = self.now()
+        if not await self.store.cas_sandbox(
+            row["id"], [SandboxState.PAUSED], now=now, expect_version=row["version"],
+            state=SandboxState.RESUMING, op_owner=self.replica_id, op_deadline=now + self.cfg.resume_timeout_s,
+        ):
+            return
+        try:
+            await self.forget_client(row["id"])
+            await self.provider.resume(row["provider_id"], self.cfg.agent_platform_timeout_s)
+            await self._wait_healthy(self.client_for(row), timeout_s=self.cfg.agent_boot_timeout_s / 2)
+        except Exception as e:  # noqa: BLE001
+            fresh = await self.store.get_sandbox(row["id"])
+            if fresh and fresh["state"] == SandboxState.RESUMING.value and fresh["op_owner"] == self.replica_id:
+                await self.lc.destroy(fresh, f"resume failed: {e}")
+            raise SandboxOpError(f"resume failed: {e}") from e
+        now = self.now()
+        if not await self.store.cas_sandbox(
+            row["id"], [SandboxState.RESUMING], now=now, expect_owner=self.replica_id,
+            state=SandboxState.ACTIVE, op_owner=None, op_deadline=None,
+            platform_deadline=now + self.cfg.agent_platform_timeout_s,
+        ):
+            raise SandboxOpError(f"resume lost ownership of sandbox {row['id']}")
+        self._just_resumed.add(row["id"])
+        await self.lc.event("agent_resume", sandbox_row_id=row["id"])
+
     async def _boot(self, row: dict, agent: dict) -> None:
-        """CREATING → WARMING → ACTIVE：建沙箱（出网规则 + 凭证注入）、等沙箱内 agent 服务健康、写配置文件、预加载实例。"""
+        """CREATING → WARMING → ACTIVE：建沙箱（出网规则 + 凭证注入）、等沙箱内 agent 服务健康、写配置文件、预加载实例。
+
+        耗时是同一只 perf_counter 上的连续分段，本地间隙并入下一段，各段之和写入 agent_boot。
+        """
         provider_id = None
         t0 = time.perf_counter()
+        cursor = t0
+        recorded: list[float] = []
+
+        async def lap(kind: str) -> None:
+            nonlocal cursor
+            recorded.append((time.perf_counter() - cursor) * 1000)
+            cursor = time.perf_counter()
+            await self.lc.event(kind, sandbox_row_id=row["id"], duration_ms=recorded[-1])
+
         try:
             engine = self.engine_for(row)
             policy = self.effective_policy(agent)
@@ -385,7 +607,7 @@ class AgentService:
                 network=build_network(policy, self.injections),
             )
             provider_id = app.sandbox_id
-            await self.lc.event("agent_create", sandbox_row_id=row["id"], duration_ms=(time.perf_counter() - t0) * 1000)
+            await lap("agent_create")
             now = self.now()
             values = dict(
                 provider_id=app.sandbox_id,
@@ -411,12 +633,16 @@ class AgentService:
                 await self.provider.write_files(provider_id, {
                     "/home/user/.agent/server-password": server_password(app.access_token).encode()
                 }, sandbox_timeout_s=timeout)
+                await lap("agent_boot_password")
             client = self.client_for(row)
             await self._wait_healthy(client, timeout_s=self.cfg.agent_boot_timeout_s / 2)
+            await lap("agent_boot_health")
             fresh_agent = await self.store.get_agent_by_id(agent["id"]) or agent
             await self._write_agent_files(row, fresh_agent, policy, version)
+            await lap("agent_boot_files")
             # 预加载（opencode：读取工作目录的 opencode.json、连接 MCP），首个请求不必等
             await client.status()
+            await lap("agent_boot_preload")
             now = self.now()
             ok = await self.store.activate_sandbox(
                 row["id"],
@@ -431,15 +657,22 @@ class AgentService:
                 if fresh and fresh["state"] == SandboxState.WARMING.value and fresh["op_owner"] == self.replica_id:
                     await self.lc.destroy(fresh, "activate failed")
                 return
+            await lap("agent_boot_activate")
+            total_ms = sum(recorded)
             self._boot_errors.pop(agent["id"], None)
-            await self.lc.event("agent_boot", sandbox_row_id=row["id"], duration_ms=(time.perf_counter() - t0) * 1000)
-            log.info("agent %s sandbox %s ready in %.1fs", agent["id"], app.sandbox_id, time.perf_counter() - t0)
+            await self.lc.event("agent_boot", sandbox_row_id=row["id"], duration_ms=total_ms)
+            log.info("agent %s sandbox %s ready in %.1fs", agent["id"], app.sandbox_id, total_ms / 1000)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
             log.warning("boot agent sandbox failed: %r", e, exc_info=True)
             self._boot_errors[agent["id"]] = f"{type(e).__name__}: {e}"[:500]
-            await self.lc.event("agent_boot_failed", sandbox_row_id=row["id"], detail=str(e)[:500])
+            await self.lc.event(
+                "agent_boot_failed",
+                sandbox_row_id=row["id"],
+                detail=str(e)[:500],
+                duration_ms=(time.perf_counter() - t0) * 1000,
+            )
             try:
                 fresh = await self.store.get_sandbox(row["id"])
                 if fresh and fresh["op_owner"] == self.replica_id and fresh["state"] in (
@@ -543,12 +776,86 @@ class AgentService:
         """销毁该 agent 的全部沙箱（运行中任务记为失败），下次请求重新创建。"""
         destroyed = 0
         for row in await self.store.agent_sandboxes(agent["id"]):
-            if row["state"] in (SandboxState.ACTIVE.value, SandboxState.RETIRING.value):
+            if row["state"] in (SandboxState.ACTIVE.value, SandboxState.RETIRING.value, SandboxState.PAUSED.value):
                 await self.fail_tasks(row["id"], "sandbox reset by user")
                 if await self.lc.destroy(row, "reset by user"):
                     destroyed += 1
         self.maintainer.kick()
         return {"destroyed": destroyed}
+
+    def _absolute_path(self, path: Optional[str], *, required: bool) -> str:
+        if path is None or path == "":
+            if required:
+                raise InvalidRequest("path is required")
+            return "/"
+        if not path.startswith("/"):
+            raise InvalidRequest("path must be absolute")
+        norm = posixpath.normpath(path)
+        if not norm.startswith("/"):
+            raise InvalidRequest("path must be absolute")
+        return norm
+
+    async def _active_sandbox(self, agent: dict) -> dict:
+        """只操作当前 ACTIVE 的沙箱。休眠、创建中和恢复中直接拒绝，避免 connect() 把休眠实例唤醒。"""
+        rows = await self.store.agent_sandboxes(agent["id"])
+        if not rows:
+            raise AgentNotFound(f"agent {agent['user_id']} has no sandbox")
+        active = [row for row in rows if row["state"] == SandboxState.ACTIVE.value and row.get("provider_id")]
+        if not active:
+            raise SandboxBusy("sandbox is not running; start it before using files")
+        return active[0]
+
+    async def list_files(self, agent: dict, path: Optional[str]) -> dict:
+        path = self._absolute_path(path, required=False)
+        row = await self._active_sandbox(agent)
+        try:
+            entries = await self.provider.list_dir(
+                row["provider_id"], path, sandbox_timeout_s=self.platform_timeout_for(row),
+            )
+        except NotADirectoryError as e:
+            raise InvalidRequest(f"{path} is a file") from e
+        entries.sort(key=lambda item: (item.type != "dir", item.name))
+        return {
+            "path": path,
+            "entries": [
+                {"name": item.name, "path": item.path, "type": item.type, "size": item.size}
+                for item in entries
+            ],
+        }
+
+    async def read_file(self, agent: dict, path: str) -> tuple[str, bytes]:
+        path = self._absolute_path(path, required=True)
+        row = await self._active_sandbox(agent)
+        try:
+            data = await self.provider.read_file(
+                row["provider_id"], path, sandbox_timeout_s=self.platform_timeout_for(row),
+            )
+        except IsADirectoryError as e:
+            raise InvalidRequest(f"{path} is a directory") from e
+        return path, data
+
+    async def write_file(self, agent: dict, path: str, data: bytes) -> dict:
+        path = self._absolute_path(path, required=True)
+        row = await self._active_sandbox(agent)
+        await self.provider.write_file(
+            row["provider_id"], path, data, sandbox_timeout_s=self.platform_timeout_for(row),
+        )
+        return {"path": path, "size": len(data)}
+
+    async def admin_destroy_sandbox(self, row_id: str) -> dict:
+        """管理员销毁这一台 agent 沙箱。不删除身份、设置和任务历史。过渡态返回失败。"""
+        row = await self.store.get_sandbox(row_id)
+        if row is None or row["pool"] != self.cfg.agent_pool_name:
+            raise SandboxRecordNotFound(f"sandbox {row_id} not found")
+        if row["state"] not in (
+            SandboxState.ACTIVE.value, SandboxState.RETIRING.value, SandboxState.PAUSED.value
+        ):
+            raise SandboxBusy(f"sandbox {row_id} is {row['state']}, retry later")
+        await self.fail_tasks(row["id"], "sandbox destroyed by admin")
+        if not await self.lc.destroy(row, "destroyed by admin"):
+            raise SandboxBusy(f"sandbox {row_id} is {row['state']}, retry later")
+        self.maintainer.kick()
+        return {"id": row_id, "provider_id": row.get("provider_id"), "previous_state": row["state"]}
 
     async def fail_tasks(self, sandbox_row_id: str, reason: str) -> None:
         for t in await self.store.running_tasks(sandbox_row_id=sandbox_row_id):
@@ -614,10 +921,15 @@ class AgentService:
         if session_id:
             row_id = await self.store.session_sandbox(agent["id"], session_id)
             row = await self.store.get_sandbox(row_id) if row_id else None
-            if row is None or row["state"] != SandboxState.ACTIVE.value:
+            if row is None or row["state"] not in (SandboxState.ACTIVE.value, SandboxState.PAUSED.value):
                 raise TaskConflict(
                     f"session {session_id} is no longer available (its sandbox was rotated or destroyed); start a new session"
                 )
+            if row["state"] == SandboxState.PAUSED.value:
+                await self._resume_one(row)
+                row = await self.store.get_sandbox(row["id"])
+                if row is None or row["state"] != SandboxState.ACTIVE.value:
+                    raise TaskConflict(f"session {session_id} is no longer available; start a new session")
             if self.engine_for(row).name != engine.name:
                 # 刚切换了引擎、维护循环还没把旧沙箱转为 RETIRING：与切换后的语义一致，旧会话不能续聊
                 raise TaskConflict(

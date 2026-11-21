@@ -1,7 +1,7 @@
 """请求体大小上限（纯 ASGI 中间件，在路由和鉴权之前生效）。
 
 FastAPI 在执行鉴权依赖之前就会读完并解析 JSON 请求体：没有上限时，不带 key 的请求也能让副本缓冲任意大的请求体。
-上传文件的接口（PUT /v1/leases/{id}/files）先鉴权、再由路由按 max_upload_bytes 流式计数，这里放行。
+上传文件的接口（PUT /v1/leases/{id}/files 与 PUT /v1/agents/{user_id}/files）先鉴权、再由路由按 max_upload_bytes 流式计数，这里放行。
 """
 
 import re
@@ -11,7 +11,7 @@ from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-_UPLOAD_PATH = re.compile(r"^/v1/leases/[^/]+/files$")
+_UPLOAD_PATH = re.compile(r"^/v1/(?:leases|agents)/[^/]+/files$")
 
 
 class BodyTooLarge(HTTPException):

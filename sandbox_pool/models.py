@@ -91,7 +91,15 @@ class LeaseNotActive(PoolError):
 
 
 class SandboxOpError(PoolError):
-    pass
+    """沙箱后端调用失败。
+
+    attempt_ids / attempts 只给启动接口带回失败尝试；其它路径仍只使用异常文案。
+    """
+
+    def __init__(self, message: str = "", *args, attempt_ids: Optional[list] = None):
+        super().__init__(message, *args)
+        self.attempt_ids = list(attempt_ids or [])
+        self.attempts: list = []
 
 
 class SandboxRecordNotFound(PoolError):

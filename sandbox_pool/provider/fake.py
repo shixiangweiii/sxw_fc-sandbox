@@ -16,6 +16,7 @@ from sandbox_pool.provider.base import (
     AppSandbox,
     CodeResult,
     CommandResult,
+    DirEntry,
     ExecutionTimeout,
     ProviderSandbox,
     SandboxNotFound,
@@ -23,6 +24,14 @@ from sandbox_pool.provider.base import (
 )
 from sandbox_pool.provider.fake_opencode import FakeOpencodeClient, FakeOpencodeServer, FakeOpencodeV2Client
 from sandbox_pool.provider.fake_pi import FakePiClient, FakePiServer
+
+
+def _has_child(files: dict, path: str) -> bool:
+    """路径下面还有已写入的文件时，它就是目录。根目录始终由调用方单独处理。"""
+    if path == "/":
+        return bool(files)
+    prefix = path.rstrip("/") + "/"
+    return any(stored.startswith(prefix) for stored in files)
 
 
 class FakeProvider:
@@ -162,14 +171,20 @@ class FakeProvider:
         sb = self.sandboxes.get(sandbox_id)
         return sb["state"] if sb else None
 
+    def _visible(self) -> list[ProviderSandbox]:
+        self._sweep()
+        return [
+            ProviderSandbox(sid, sb["state"], dict(sb["metadata"]), sb["started_at"])
+            for sid, sb in self.sandboxes.items()
+        ]
+
     async def list(self, metadata: dict[str, str]) -> list[ProviderSandbox]:
         self.calls.append(("list", ""))
-        self._sweep()
-        out = []
-        for sid, sb in self.sandboxes.items():
-            if all(sb["metadata"].get(k) == v for k, v in metadata.items()):
-                out.append(ProviderSandbox(sid, sb["state"], dict(sb["metadata"]), sb["started_at"]))
-        return out
+        return [item for item in self._visible() if all(item.metadata.get(k) == v for k, v in metadata.items())]
+
+    async def list_account(self) -> "list[ProviderSandbox]":
+        self.calls.append(("list_account", ""))
+        return self._visible()
 
     def _maybe_exec_timeout(self, timeout_s: float) -> None:
         if self.exec_timeouts > 0:
@@ -217,8 +232,34 @@ class FakeProvider:
     async def read_file(self, sandbox_id, path, *, sandbox_timeout_s) -> bytes:
         files = self._running(sandbox_id)["files"]
         if path not in files:
+            if _has_child(files, path):
+                raise IsADirectoryError(path)
             raise FileNotFoundError(path)
         return files[path]
+
+    async def list_dir(self, sandbox_id: str, path: str, *, sandbox_timeout_s: float) -> "list[DirEntry]":
+        """按已写入的扁平路径合成一层目录。/a/b.txt 在列出 /a 时是文件 b.txt，列出 / 时是目录 a。"""
+        files = self._running(sandbox_id)["files"]
+        directory = _has_child(files, path) or path == "/"
+        if path in files and not directory:
+            raise NotADirectoryError(path)
+        if not directory:
+            raise FileNotFoundError(path)
+        prefix = "/" if path == "/" else path.rstrip("/") + "/"
+        found: dict[str, DirEntry] = {}
+        for stored, data in files.items():
+            if not stored.startswith(prefix):
+                continue
+            rest = stored[len(prefix):]
+            if not rest:
+                continue
+            name, sep, _tail = rest.partition("/")
+            child = prefix + name
+            if sep:
+                found[name] = DirEntry(name, child, "dir", 0)
+            elif name not in found or found[name].type != "dir":
+                found[name] = DirEntry(name, child, "file", len(data))
+        return list(found.values())
 
     def forget(self, sandbox_id: str) -> None:
         self.calls.append(("forget", sandbox_id))

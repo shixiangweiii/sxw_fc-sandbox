@@ -23,6 +23,7 @@
   - 按 Eco 规则设计：沙箱最长 24h，自动轮换，支持空闲销毁。
   - 新版研究模板支持 OpenCode 2.3.2（`opencode2`）和 Pi 1.6.0（`pi1`），分别通过 `POOL_AGENT_OPENCODE2_TEMPLATE` 与 `POOL_AGENT_PI1_TEMPLATE` 启用。模板 ID、构建命令和验证范围见[升级验证记录](sxw_aicoding/方案设计/2026-11-21-OpenCode2与Pi1云沙箱升级验证.md)。
   - 接入方式见 [业务接入使用手册](sxw_aicoding/2026-09-25-opencode常驻agent-业务接入使用手册.md)。
+  - 本机操作台：服务起来后打开 `/console`，选择引擎、先启动沙箱再对话；运行中还可以浏览和传沙箱文件。
 
 ## 架构
 
@@ -99,6 +100,14 @@ curl -s -X PUT  "localhost:8000/v1/leases/$LEASE/files?path=/tmp/in.csv" -H "$H"
 curl -s -X POST localhost:8000/v1/leases/$LEASE/renew -H "$H" -H 'content-type: application/json' -d '{"ttl_s": 1200}'
 curl -s -X DELETE localhost:8000/v1/leases/$LEASE -H "$H"          # 归还：沙箱随即销毁
 ```
+
+## 操作台
+
+`POOL_AGENT_ENABLED=true` 时，浏览器打开 `http://127.0.0.1:8000/console`。页面本身不鉴权，调用接口时在页面里填写调用方 Key。可以选择这次进程启用的引擎，先 `POST /v1/agents/{user_id}/sandbox` 把沙箱做到可对话，再发消息。右侧是沙箱状态、本轮工具事件，以及启动的总耗时和分步耗时。沙箱运行中时，右侧还可以按目录查看、上传和下载沙箱里的文件；休眠或未启动时页面不发文件请求。不打开这个页面时，发消息和定时任务仍会在没有沙箱时自动创建。
+
+## 实例管理
+
+浏览器打开 `http://127.0.0.1:8000/admin`。页面本身不鉴权，接口要管理员 Key（未配置任何 Key 的本机模式可以留空）。清单来自当前账号、当前地域的云端实例，包含运行中和休眠中，并与代码池、常驻 agent 的库记录对齐。停止只把空闲的代码沙箱暂停；常驻 agent 不能休眠。删除才会销毁实例：借出中的先结束借用，孤儿按云端实例号删除。云端列表有短暂延迟，删完可以再刷新一次。同一页还可以查看本团队模板是否已有缓存，并为模板新建或删除缓存。费用按缓存容量和存放小时计算，不是按启动次数；删除或被平台淘汰后停止。未配置阿里云 AK、地域和团队 ID 时，这块只显示未配置，不影响实例管理。
 
 ## HTTP 接口
 

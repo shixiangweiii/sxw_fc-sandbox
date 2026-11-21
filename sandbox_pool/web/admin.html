@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>沙箱实例管理</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3f1ec;
+      --ink: #1c1b18;
+      --muted: #5f5b53;
+      --line: #d8d2c6;
+      --card: #fffdf8;
+      --accent: #0d6b58;
+      --accent-ink: #f7fffc;
+      --bad: #8d2b2b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 15px/1.45 "Iowan Old Style", Palatino, "Songti SC", serif;
+      color: var(--ink);
+      background: var(--bg);
+    }
+    header, main { width: min(1180px, calc(100% - 28px)); margin: 0 auto; }
+    header { padding: 24px 0 8px; }
+    h1 { margin: 0 0 6px; font-size: 28px; font-weight: 600; }
+    h2 { margin: 28px 0 8px; font-size: 20px; font-weight: 600; }
+    .hint { color: var(--muted); margin: 0; font-size: 13px; }
+    .bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin: 16px 0; }
+    label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+    input, button { font: inherit; color: inherit; }
+    input { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: #fff; }
+    button {
+      border: 0; border-radius: 8px; padding: 8px 12px;
+      background: var(--accent); color: var(--accent-ink); cursor: pointer;
+    }
+    button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+    button:disabled { opacity: 0.45; cursor: default; }
+    table { width: 100%; border-collapse: collapse; background: var(--card); }
+    th, td { border-bottom: 1px solid var(--line); text-align: left; padding: 8px 10px; vertical-align: top; }
+    th { font-size: 13px; color: var(--muted); font-weight: 600; }
+    .banner { min-height: 1.2em; margin: 0 0 12px; font-size: 13px; }
+    .banner.bad { color: var(--bad); }
+    .note { color: var(--muted); font-size: 12px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>沙箱实例管理</h1>
+    <p class="hint">查看当前账号地域里运行中和休眠中的实例。停止只暂停空闲的代码沙箱；删除才会销毁。云端列表有短暂延迟，删完可以再刷新一次。</p>
+  </header>
+  <main>
+    <div class="bar">
+      <label>管理员 Key<input id="key" type="password" autocomplete="off" placeholder="未开鉴权可留空"></label>
+      <button id="reload" type="button">刷新</button>
+    </div>
+    <p id="msg" class="banner"></p>
+    <table>
+      <thead>
+        <tr>
+          <th>云端</th>
+          <th>库内</th>
+          <th>种类</th>
+          <th>池</th>
+          <th>模板 / 引擎</th>
+          <th>归属</th>
+          <th>启动时间</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <h2>模板缓存</h2>
+    <p class="hint">查看本团队模板是否已有缓存。费用按缓存容量和存放小时计算，不是按启动次数。删除或被平台淘汰后停止计费。这里不暂停、不销毁已经跑着的实例。</p>
+    <div class="bar">
+      <button id="cache-reload" class="ghost" type="button">刷新缓存</button>
+    </div>
+    <p id="cache-msg" class="banner"></p>
+    <table>
+      <thead>
+        <tr>
+          <th>模板</th>
+          <th>名称</th>
+          <th>缓存</th>
+          <th>进度</th>
+          <th>容量</th>
+          <th>就绪时间</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="cache-rows"></tbody>
+    </table>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const keyInput = $("key");
+    keyInput.value = sessionStorage.getItem("admin.apiKey") || "";
+    const TRANSITIONAL = new Set(["CREATING", "WARMING", "PAUSING", "RESUMING", "DESTROYING"]);
+
+    function headers(json) {
+      const h = {};
+      if (json) h["Content-Type"] = "application/json";
+      const key = keyInput.value.trim();
+      if (key) h.Authorization = "Bearer " + key;
+      return h;
+    }
+    function persist() { sessionStorage.setItem("admin.apiKey", keyInput.value); }
+    function setMsg(text, bad) {
+      const el = $("msg");
+      el.textContent = text || "";
+      el.className = "banner" + (bad ? " bad" : "");
+    }
+    function when(ts) {
+      return ts == null ? "—" : new Date(ts * 1000).toLocaleString();
+    }
+    function cell(text) {
+      const td = document.createElement("td");
+      td.textContent = text == null || text === "" ? "—" : String(text);
+      return td;
+    }
+    async function readError(resp) {
+      try {
+        const body = await resp.json();
+        return body.detail || body.error || resp.statusText;
+      } catch (e) {
+        return resp.statusText || String(resp.status);
+      }
+    }
+    function actions(item) {
+      const wrap = document.createElement("td");
+      const busy = TRANSITIONAL.has(item.db_state);
+      if (item.kind === "code" && item.db_state === "READY") {
+        wrap.append(button("停止", () => pause(item), busy));
+      }
+      const del = button("删除", () => remove(item), busy || (!item.row_id && !item.provider_id));
+      wrap.append(del);
+      if (item.db_state === "LEASED") {
+        const note = document.createElement("div");
+        note.className = "note";
+        note.textContent = "删除会先结束借用";
+        wrap.append(note);
+      }
+      if (busy) {
+        const note = document.createElement("div");
+        note.className = "note";
+        note.textContent = "过渡态，稍后刷新";
+        wrap.append(note);
+      }
+      return wrap;
+    }
+    function button(label, fn, disabled) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = label === "删除" ? "ghost" : "";
+      b.textContent = label;
+      b.disabled = disabled;
+      b.style.marginRight = "6px";
+      b.addEventListener("click", fn);
+      return b;
+    }
+    function render(items) {
+      const body = $("rows");
+      body.replaceChildren();
+      for (const item of items) {
+        const tr = document.createElement("tr");
+        const who = item.user_id ? (item.client_id || "") + " / " + item.user_id : (item.client_id || "");
+        const spec = [item.template, item.engine].filter(Boolean).join(" · ");
+        tr.append(
+          cell(item.cloud_state),
+          cell(item.db_state),
+          cell(item.kind),
+          cell(item.pool),
+          cell(spec),
+          cell(who),
+          cell(when(item.started_at)),
+          actions(item),
+        );
+        body.appendChild(tr);
+      }
+      if (!items.length) {
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 8;
+        td.textContent = "没有运行中或休眠中的实例";
+        tr.appendChild(td);
+        body.appendChild(tr);
+      }
+    }
+    async function load() {
+      persist();
+      const resp = await fetch("/v1/admin/instances", { headers: headers(false) });
+      if (!resp.ok) {
+        setMsg(await readError(resp), true);
+        return null;
+      }
+      const items = await resp.json();
+      render(items);
+      return items;
+    }
+    async function reload() {
+      setMsg("正在刷新…");
+      const items = await load();
+      if (items) setMsg("共 " + items.length + " 条");
+    }
+    async function pause(item) {
+      const resp = await fetch("/v1/admin/instances/" + encodeURIComponent(item.row_id) + "/pause", {
+        method: "POST", headers: headers(false),
+      });
+      if (!resp.ok) {
+        setMsg(await readError(resp), true);
+        return;
+      }
+      await load();
+      setMsg("已暂停");
+    }
+    async function remove(item) {
+      const body = item.row_id ? { row_id: item.row_id } : { provider_id: item.provider_id };
+      const resp = await fetch("/v1/admin/instances", {
+        method: "DELETE", headers: headers(true), body: JSON.stringify(body),
+      });
+      if (!resp.ok) {
+        setMsg(await readError(resp), true);
+        return;
+      }
+      await load();
+      setMsg("已删除。云端列表若仍显示它，稍后再刷新。");
+    }
+    let cacheTimer = null;
+    function setCacheMsg(text, bad) {
+      const el = $("cache-msg");
+      el.textContent = text || "";
+      el.className = "banner" + (bad ? " bad" : "");
+    }
+    function armCachePoll(busy) {
+      if (cacheTimer) clearInterval(cacheTimer);
+      cacheTimer = null;
+      if (busy) cacheTimer = setInterval(() => { loadCaches().catch((e) => setCacheMsg(String(e), true)); }, 5000);
+    }
+    function cacheActions(row) {
+      const wrap = document.createElement("td");
+      const status = row.cache && row.cache.status;
+      const canCreate = !row.cache || status === "Failed" || status === "Evicted";
+      const canDelete = row.cache && status !== "Deleting";
+      if (canCreate) wrap.append(button("新建缓存", () => createCache(row), false));
+      if (canDelete) {
+        const del = button("删除缓存", () => deleteCache(row), false);
+        del.className = "ghost";
+        wrap.append(del);
+      }
+      return wrap;
+    }
+    function renderCaches(body) {
+      const rows = $("cache-rows");
+      rows.replaceChildren();
+      if (!body.configured) {
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 7;
+        td.textContent = body.detail || "未配置模板缓存";
+        tr.appendChild(td);
+        rows.appendChild(tr);
+        armCachePoll(false);
+        return;
+      }
+      const items = body.templates || [];
+      for (const item of items) {
+        const cache = item.cache;
+        const tr = document.createElement("tr");
+        tr.append(
+          cell(item.template_id),
+          cell(item.name),
+          cell(cache ? cache.status : "未创建"),
+          cell(cache && cache.progress != null ? cache.progress + "%" : null),
+          cell(cache && cache.image_size_mb != null ? cache.image_size_mb + " MB" : null),
+          cell(cache ? cache.ready_time : null),
+          cacheActions(item),
+        );
+        rows.appendChild(tr);
+      }
+      if (!items.length) {
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 7;
+        td.textContent = "这个团队还没有模板";
+        tr.appendChild(td);
+        rows.appendChild(tr);
+      }
+      armCachePoll(items.some((item) => item.cache && item.cache.status === "InProgress"));
+    }
+    async function loadCaches() {
+      persist();
+      const resp = await fetch("/v1/admin/template-caches", { headers: headers(false) });
+      if (!resp.ok) {
+        setCacheMsg(await readError(resp), true);
+        return null;
+      }
+      const body = await resp.json();
+      renderCaches(body);
+      return body;
+    }
+    async function reloadCaches() {
+      setCacheMsg("正在刷新缓存…");
+      const body = await loadCaches();
+      if (!body) return;
+      if (!body.configured) {
+        setCacheMsg(body.detail || "未配置", true);
+        return;
+      }
+      setCacheMsg("共 " + (body.templates || []).length + " 个模板");
+    }
+    async function createCache(row) {
+      const resp = await fetch("/v1/admin/template-caches", {
+        method: "POST", headers: headers(true), body: JSON.stringify({ template_id: row.template_id }),
+      });
+      if (!resp.ok) {
+        setCacheMsg(await readError(resp), true);
+        await loadCaches();
+        return;
+      }
+      await loadCaches();
+      setCacheMsg("已提交预热，状态变为成功前会继续刷新");
+    }
+    async function deleteCache(row) {
+      const ok = window.confirm("删除后按容量计时的费用停止。确定删除模板 " + row.template_id + " 的缓存？");
+      if (!ok) return;
+      const resp = await fetch("/v1/admin/template-caches/" + encodeURIComponent(row.template_id), {
+        method: "DELETE", headers: headers(false),
+      });
+      if (!resp.ok) {
+        setCacheMsg(await readError(resp), true);
+        return;
+      }
+      await loadCaches();
+      setCacheMsg("已删除缓存");
+    }
+    $("reload").addEventListener("click", () => { reload().catch((e) => setMsg(String(e), true)); });
+    $("cache-reload").addEventListener("click", () => { reloadCaches().catch((e) => setCacheMsg(String(e), true)); });
+    reload().catch((e) => setMsg(String(e), true));
+    reloadCaches().catch((e) => setCacheMsg(String(e), true));
+  </script>
+</body>
+</html>
