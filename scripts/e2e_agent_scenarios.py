@@ -1,7 +1,7 @@
 """agent 子系统端到端场景（真实云沙箱 + 本地多副本集群）。结果写入 .data/e2e-agent-report.json（不含密钥）。
 
     # 先按 sxw_aicoding/…业务接入使用手册.md 配置环境变量并启动集群（POOL_AGENT_ENABLED=true）
-    python scripts/e2e_agent_scenarios.py [--only S1,S2,...] [--replicas 8001,8002] [--engine opencode|pi]
+    python scripts/e2e_agent_scenarios.py [--only S1,S2,...] [--replicas 8001,8002] [--engine opencode|pi|opencode2|pi1]
 
 --engine：先把测试用户的引擎设为指定值（不传则用服务端默认引擎）；报告写入 .data/e2e-agent-report-<引擎>.json。
 

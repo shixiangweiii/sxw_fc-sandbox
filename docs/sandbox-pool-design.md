@@ -37,7 +37,7 @@
 ## 3. 沙箱状态机
 
 ```
-            补货（总数 < target，未熔断、未排空）
+            补货（非 DESTROYING 的数量 < target，且总数 < max；未熔断、未排空）
                  ▼
              CREATING ──► WARMING（执行预热代码）──► READY（运行中，空闲；平台超时由保活续期）
                                                       │  ▲
@@ -185,16 +185,19 @@ python scripts/cleanup_sandboxes.py     # 兜底：销毁账号下全部沙箱�
 - 自动加列只处理新增的可空列，生产环境建议用 Alembic 管理表结构。
 - 下载文件（`GET files`）仍整体读入内存，大文件可改为流式转发。
 - 已实测暂停中的沙箱不受 `timeout` 回收（超过 `end_at` 后仍可恢复，内存还在），所以 PAUSED 不需要续期、也不跟踪 `platform_deadline`。平台侧单个沙箱的最长存活时间还未实测，`max_age_s` 先取 6 小时。
+- 2026-10-16 之后，代码池创建时默认断网并关闭公网直达。借用时的 `egress`、输出截断和命令超时保留输出见 README 与 `sandbox_pool/egress.py`。管理员实例清单和模板缓存在 `/v1/admin/instances`、`/v1/admin/template-caches`，页面是 `/admin`。
 
-## 10. agent 子系统（常驻 agent，引擎可选 opencode / pi）
+## 10. agent 子系统（常驻 agent）
 
-同一进程可选开启 agent 子系统（`POOL_AGENT_ENABLED=true`）：每个（调用方，用户）一个运行在云沙箱里的常驻 agent，与代码执行池共用 provider 和数据库，使用独立的池名（默认 `agents`）。引擎按 agent 选择：opencode（`opencode serve`）或 pi（沙箱内桥接进程 + 每会话一个 `pi --mode rpc`），每个引擎一个模板，切换引擎等于换沙箱。
-- 设计与执行结果：`sxw_aicoding/方案设计/2026-09-25-opencode应用沙箱池-实施方案.md`；pi 与多引擎：`sxw_aicoding/方案设计/2026-09-26-pi引擎接入-实施方案.md`；
-- 接入：`sxw_aicoding/2026-09-25-opencode常驻agent-业务接入使用手册.md`；
-- 测试：`sxw_aicoding/2026-09-25-opencode常驻agent-测试报告.md`。
+同一进程可选开启 agent 子系统（`POOL_AGENT_ENABLED=true`）：每个（调用方，用户）一个运行在云沙箱里的常驻 agent，与代码执行池共用 provider 和数据库，使用独立的池名（默认 `agents`）。引擎按 agent 选择，配了模板才启用：`opencode`、`pi`、`opencode2`、`pi1`。切换引擎等于换沙箱。
+- 现行接入说明：`sxw_aicoding/2026-09-25-opencode常驻agent-业务接入使用手册.md`；
+- OpenCode 2.3.2 与 Pi 1.6.0：`sxw_aicoding/方案设计/2026-11-21-OpenCode2与Pi1云沙箱升级验证.md`；
+- 当时的设计与执行结果：`sxw_aicoding/方案设计/2026-09-25-opencode应用沙箱池-实施方案.md`、`sxw_aicoding/方案设计/2026-09-26-pi引擎接入-实施方案.md`；
+- 2026-09 的测试记录：`sxw_aicoding/2026-09-25-opencode常驻agent-测试报告.md`。
 
 与代码执行池的主要差异：
-- 沙箱绑定到 agent，长期服务：ACTIVE → RETIRING → DESTROYING；不暂停（按 Eco 规则，最长 24h，20h 后空闲即轮换）；
+- 沙箱绑定到 agent，长期服务：`CREATING → WARMING → ACTIVE → RETIRING → DESTROYING`。空闲不会自动暂停。调用方可以显式休眠（`PAUSING → PAUSED`），下次使用时恢复。管理页的暂停不作用于 agent 沙箱。默认 20 小时后空闲即轮换，23.5 小时硬截止；
+- `agent_max_sandboxes` 统计该池全部未删除记录。代码池的补货目标不统计 `DESTROYING`，这条不照搬到 agent 池；
 - 任务在后台 runner 里执行：客户端断开不影响，心跳过期由其他副本接管；
-- 出网规则（`network.rules` 凭证注入、白名单 / 黑名单）在创建时下发，运行中由 `update_network` 更新。
+- 出网规则（`network.rules` 凭证注入、白名单 / 开放模式）在创建时下发，运行中由 `update_network` 更新。本机操作台是 `/console`。
 

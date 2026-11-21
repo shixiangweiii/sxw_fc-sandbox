@@ -15,13 +15,14 @@
   借用时可以用 `egress` 按域名放行；服务端下发后会**读回平台回显核对**，对不上就不把沙箱交出去。
 - **多副本高可用**：副本无状态，所有协调都通过数据库条件更新（CAS）完成，不需要选主。副本崩溃后，其他副本会接管它未完成的操作（按云端实际状态收回或销毁）、清理云端孤儿，并定期对账。本地用「多进程 + 共享 SQLite」模拟，生产可以换 Postgres。
 - **运维**：Bearer Token 鉴权（调用方 / 管理员两类 key，借用绑定到调用方）、排空接口、创建失败熔断、历史记录自动清理、`/v1/pool/stats` 耗时统计。
-- **常驻 agent（agent 子系统，`POOL_AGENT_ENABLED=true`）**：每个用户一个运行在云沙箱里的常驻 agent（DeepSeek 模型、百炼联网搜索 MCP），通过 `/v1/agents/{user_id}/...` 调用：
-  - agent loop 引擎可按用户选择：[opencode](https://opencode.ai)（默认）或 [pi](https://pi.dev)，对外接口相同；
-  - 支持同步流式对话、长任务断线重连、定时任务；
+- **常驻 agent（agent 子系统，`POOL_AGENT_ENABLED=true`）**：每个用户一个运行在云沙箱里的常驻 agent（默认模型 `deepseek/deepseek-flash`，百炼联网搜索 MCP 可配），通过 `/v1/agents/{user_id}/...` 调用：
+  - 引擎按 agent 选择，对外接口相同。旧版是 [opencode](https://opencode.ai) 1.18.32（`opencode`，`POOL_AGENT_TEMPLATE`）和 [pi](https://pi.dev) 0.87.1（`pi`，`POOL_AGENT_PI_TEMPLATE`）。研究模板是 OpenCode 2.3.2（`opencode2`，`POOL_AGENT_OPENCODE2_TEMPLATE`）和 Pi 1.6.0（`pi1`，`POOL_AGENT_PI1_TEMPLATE`）。配了模板才启用，默认引擎必须是已启用的那个；
+  - 支持同步流式对话、长任务断线重连、定时任务。可以先把沙箱启动到可对话，也可以显式休眠，下次消息再恢复。空闲不会自动暂停；
+  - 沙箱处于 `ACTIVE` 时可以按绝对路径列一层目录、上传和下载文件。休眠、创建中或恢复中时这些接口直接拒绝，避免把休眠实例唤醒；
   - 出网策略可配置，业务系统和 agent 都能读到当前策略；
   - 模型与 MCP 的 Key 由平台在出网时注入，不进沙箱；
-  - 按 Eco 规则设计：沙箱最长 24h，自动轮换，支持空闲销毁。
-  - 新版研究模板支持 OpenCode 2.3.2（`opencode2`）和 Pi 1.6.0（`pi1`），分别通过 `POOL_AGENT_OPENCODE2_TEMPLATE` 与 `POOL_AGENT_PI1_TEMPLATE` 启用。模板 ID、构建命令和验证范围见[升级验证记录](sxw_aicoding/方案设计/2026-11-21-OpenCode2与Pi1云沙箱升级验证.md)。
+  - 按 Eco 规则设默认寿命：20 小时后空闲即轮换，23.5 小时硬截止，可按用户设置空闲销毁。
+  - 模板 ID、构建命令和 2026-11-21 的验证范围见[升级验证记录](sxw_aicoding/方案设计/2026-11-21-OpenCode2与Pi1云沙箱升级验证.md)。
   - 接入方式见 [业务接入使用手册](sxw_aicoding/2026-09-25-opencode常驻agent-业务接入使用手册.md)。
   - 本机操作台：服务起来后打开 `/console`，选择引擎、先启动沙箱再对话；运行中还可以浏览和传沙箱文件。
 
@@ -68,6 +69,8 @@ python examples/create_gen2_template.py            # 输出模板 ID
 
 脚本基于官方代码解释器镜像创建模板，并设置好第二代运行时所需的 `start_command` / `ready_command`，否则代码解释器不会启动，`run_code` 会返回 500。
 
+默认断网、又要在借用里直接用常用 Python 包时，用 `scripts/build_pyagent_template.py` 做一份第二代预装模板，把输出的模板 ID 配给 `POOL_TEMPLATE`。官方镜像已有 numpy、pandas、matplotlib，额外包写在脚本的 `PACKAGES` 里。依赖烤进模板之后，借用时不必为了 `pip install` 打开公网。
+
 ### 3. 启动服务
 
 ```bash
@@ -107,7 +110,7 @@ curl -s -X DELETE localhost:8000/v1/leases/$LEASE -H "$H"          # 归还：�
 
 ## 实例管理
 
-浏览器打开 `http://127.0.0.1:8000/admin`。页面本身不鉴权，接口要管理员 Key（未配置任何 Key 的本机模式可以留空）。清单来自当前账号、当前地域的云端实例，包含运行中和休眠中，并与代码池、常驻 agent 的库记录对齐。停止只把空闲的代码沙箱暂停；常驻 agent 不能休眠。删除才会销毁实例：借出中的先结束借用，孤儿按云端实例号删除。云端列表有短暂延迟，删完可以再刷新一次。同一页还可以查看本团队模板是否已有缓存，并为模板新建或删除缓存。费用按缓存容量和存放小时计算，不是按启动次数；删除或被平台淘汰后停止。未配置阿里云 AK、地域和团队 ID 时，这块只显示未配置，不影响实例管理。
+浏览器打开 `http://127.0.0.1:8000/admin`。页面本身不鉴权，接口要管理员 Key（未配置任何 Key 的本机模式可以留空）。清单来自当前账号、当前地域的云端实例，包含运行中和休眠中，并与代码池、常驻 agent 的库记录对齐。这一页的停止只暂停代码池里空闲的 `READY` 沙箱；对常驻 agent 返回 400。调用方要休眠自己的 agent，用 `POST /v1/agents/{user_id}/sandbox/pause`。删除才会销毁实例：借出中的先结束借用，孤儿按云端实例号删除。云端列表有短暂延迟，删完可以再刷新一次。同一页还可以查看本团队模板是否已有缓存，并为模板新建或删除缓存。费用按缓存容量和存放小时计算，删除或被平台淘汰后停止。未配置阿里云 AK、地域和团队 ID 时，这块只显示未配置，实例清单仍可用。
 
 ## HTTP 接口
 
@@ -123,8 +126,15 @@ curl -s -X DELETE localhost:8000/v1/leases/$LEASE -H "$H"          # 归还：�
 | GET | `/v1/pool/stats` | 各状态数量、排队数、分配来源、各操作耗时 p50 / p99 |
 | GET | `/v1/sandboxes` | 沙箱列表（管理员）。不含 `lease_id`，借出中的附带借用方和到期时间 |
 | DELETE | `/v1/sandboxes/{id}` | 强制销毁沙箱（管理员），借出中的先结束借用；用于处理卡住的借用 |
-| POST / DELETE | `/v1/admin/drain` | 排空 / 恢复（管理员） |
+| POST / DELETE | `/v1/admin/drain` | 排空 / 恢复（管理员）。只作用于代码执行池，状态写在库里 |
+| GET | `/v1/admin/instances` | 当前账号、当前地域的云端实例（运行中和休眠中）与代码池、agent 池库记录对齐。不含 `access_token`、`lease_id` |
+| POST | `/v1/admin/instances/{row_id}/pause` | 暂停代码池里空闲的 `READY` 沙箱。agent 沙箱返回 400 |
+| DELETE | `/v1/admin/instances` | 请求体恰好带 `row_id` 或 `provider_id`。销毁对应实例；只有云端记录时按实例号删除孤儿 |
+| GET | `/v1/admin/template-caches` | 本团队模板及缓存。未配置阿里云 AK、地域和团队 ID 时仍返回 200，`configured` 为 false |
+| POST | `/v1/admin/template-caches` | body `{"template_id"}`。新建缓存并立即返回，不等到 `Success`。已有进行中或成功的缓存时 409。未配置凭证 503 |
+| DELETE | `/v1/admin/template-caches/{template_id}` | 删除该模板的缓存。未配置凭证 503 |
 | GET | `/healthz` | 健康检查（不鉴权） |
+| GET | `/console`、`/admin` | 本机操作台、管理页。页面不鉴权。操作台调用的 agent 接口需要 `POOL_AGENT_ENABLED=true` |
 
 - 借用只能由创建它的调用方操作，访问别人的借用返回 404。
 - 其他错误码：401 未认证、403 需要管理员、404 借用或沙箱不存在、409 借用已结束（或沙箱处于过渡态）、413 请求体过大、502 沙箱侧错误。
@@ -174,10 +184,10 @@ python -m pytest tests/test_review_fixes.py -k h1  # 单个用例
 scripts/run_local_cluster.sh start
 python scripts/e2e_scenarios.py                    # 预热暂停、突发借用、代为执行、排队、504、副本 kill -9、排空等
 scripts/run_local_cluster.sh drain && scripts/run_local_cluster.sh stop
-python scripts/cleanup_sandboxes.py                # 兜底：销毁账号下全部沙箱并确认清空
+python scripts/cleanup_sandboxes.py --pool <本次池名>   # 只销毁该池。省略 --pool 会清空当前账号、地域下的全部沙箱，包括暂停实例
 ```
 
-最近一轮结果（第二轮评审修复后）：60 个单元测试连续多轮通过；3 副本端到端测试全部场景通过，包括两次真实的 `kill -9` 崩溃接管、执行超时和管理员强制释放。详见 [`docs/sandbox-pool-r2-fix-changes.md`](docs/sandbox-pool-r2-fix-changes.md)。
+第二轮评审当时的记录是 60 个单元测试，以及 3 副本端到端（含 `kill -9`、执行超时和管理员强制释放），见 [`docs/sandbox-pool-r2-fix-changes.md`](docs/sandbox-pool-r2-fix-changes.md)。2026-11-21 的全量记录是 226 项 Python 测试和 11 项 Node 桥接测试，见[升级验证记录](sxw_aicoding/方案设计/2026-11-21-OpenCode2与Pi1云沙箱升级验证.md)。那次之后又加入借用出网、实例清单、模板缓存和引擎升级用例。当前收集数量以本地 `python -m pytest --collect-only` 为准；上面的通过数都是对应日期的历史结果。
 
 ## 实测数据（cn-hangzhou，第二代模板）
 
@@ -193,12 +203,12 @@ python scripts/cleanup_sandboxes.py                # 兜底：销毁账号下全
 ## 目录
 
 ```
-sandbox_pool/   服务代码：api/（路由、鉴权）、core/（分配、维护、生命周期）、agent/（常驻 agent：engines/ 引擎、pi_bridge/ 沙箱内 pi 桥接进程）、store/（数据库）、provider/（沙箱后端）
-tests/          单元测试（FakeProvider、内存版 opencode / pi 桥接进程）
-scripts/        本地多副本集群、端到端场景、沙箱清理、opencode / pi 模板构建与云上验证
-sxw_aicoding/   agent 子系统的调研、方案、手册与测试报告
+sandbox_pool/   服务代码：api/（路由、鉴权）、core/（分配、维护、生命周期、实例清单、模板缓存）、agent/（常驻 agent：engines/ 四套引擎、pi_bridge/ 沙箱内 pi 桥接进程）、store/、provider/、egress.py（代码池出网）、web/（操作台 index.html、管理页 admin.html）
+tests/          单元测试（FakeProvider、内存版 opencode / pi；OpenCode 2 另有 FakeOpencodeV2Client）
+scripts/        本地多副本集群、端到端场景、沙箱清理、四套引擎的模板构建与验证、预装 Python 包的代码池模板
+sxw_aicoding/   agent 子系统的调研、方案、手册、评审与测试报告
 examples/       云沙箱摸底：生命周期 demo、第二代模板创建
-docs/           调研、方案、设计、评审与改动说明
+docs/           代码池的调研、方案、设计、评审与改动说明
 ```
 
 ## 文档
@@ -215,11 +225,13 @@ docs/           调研、方案、设计、评审与改动说明
 | [opencode 常驻 agent 实施方案](sxw_aicoding/方案设计/2026-09-25-opencode应用沙箱池-实施方案.md) | agent 子系统的设计（数据模型、状态机、出网策略、流式协议、定时任务）与执行结果 |
 | [opencode 调研](sxw_aicoding/技术调研/2026-09-25-opencode云沙箱常驻agent调研.md) / [PoC 验证报告](sxw_aicoding/技术调研/2026-09-25-opencode云沙箱PoC验证报告.md) | 业界方案、平台与 opencode 实测结论 |
 | [pi 引擎接入实施方案](sxw_aicoding/方案设计/2026-09-26-pi引擎接入-实施方案.md) / [pi 调研](sxw_aicoding/技术调研/2026-09-26-pi-agent沙箱内部署与多引擎接入调研.md) | 多引擎设计（引擎抽象、pi 桥接进程、切换）、实测与执行结果 |
-| [业务接入使用手册](sxw_aicoding/2026-09-25-opencode常驻agent-业务接入使用手册.md) / [测试报告](sxw_aicoding/2026-09-25-opencode常驻agent-测试报告.md) | agent 子系统的接入、配置、运维、排障与测试结果（含引擎选择） |
+| [业务接入使用手册](sxw_aicoding/2026-09-25-opencode常驻agent-业务接入使用手册.md) | 现行接入说明：四套引擎、显式休眠、沙箱文件、操作台、实例清单和模板缓存 |
+| [OpenCode 2 与 Pi 1 升级验证](sxw_aicoding/方案设计/2026-11-21-OpenCode2与Pi1云沙箱升级验证.md) | 2026-11-21 的模板、配置和云端回归记录 |
+| [测试报告](sxw_aicoding/2026-09-25-opencode常驻agent-测试报告.md) | 2026-09-25 至 09-28 的历史测试结果 |
 
 ## 已知限制
 
 - 排队靠轮询数据库（默认 200ms）；规模变大后可以换成 Postgres LISTEN/NOTIFY 或 Redis 通知。
-- 只支持单一模板。
+- 代码执行池一次只用 `POOL_TEMPLATE` 一个模板。agent 按引擎各用各的模板。代码池若要按模板分片容量、队列和补货，需要另做。
 - 自动迁移只处理新增的可空列；生产环境建议用 Alembic 管理表结构。
 - 下载文件时整个文件会读入内存。

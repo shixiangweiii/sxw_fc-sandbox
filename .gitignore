@@ -8,3 +8,4 @@ __pycache__/
 .venv/
 # 含明文 Token 的参考文件，勿入库
 sxw_aicoding/百炼-mcp.txt
+github令牌
