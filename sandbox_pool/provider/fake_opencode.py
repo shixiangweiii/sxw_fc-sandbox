@@ -269,3 +269,73 @@ class FakeOpencodeClient:
 
     async def close(self) -> None:
         self.closed = True
+
+
+class FakeOpencodeV2Client(FakeOpencodeClient):
+    """复用内存运行器，用 V2 消息和事件表达一次运行。"""
+
+    async def messages(self, session_id):
+        rows = []
+        for message in await super().messages(session_id):
+            info, parts = message["info"], message["parts"]
+            if info["role"] == "user":
+                rows.append({"type": "user", "text": "".join(p.get("text", "") for p in parts)})
+            else:
+                row = {"type": "assistant", "content": parts, "tokens": info["tokens"], "cost": info["cost"]}
+                if info.get("error"):
+                    row["error"] = info["error"]["data"]
+                rows.append(row)
+        return rows
+
+    async def reply_permission(self, request_id, reply):
+        await super().reply_permission(request_id.split("/", 1)[1], reply)
+
+    async def reject_question(self, request_id):
+        await super().reject_question(request_id.split("/", 1)[1])
+
+    async def events(self):
+        part_types = {}
+        user_messages = set()
+        async for event in super().events():
+            props = event["properties"]
+            kind = event["type"]
+            data = {"sessionID": props.get("sessionID")}
+            if kind == "server.connected":
+                data = {}
+            elif kind == "message.updated":
+                if props["info"]["role"] == "user":
+                    user_messages.add(props["info"]["id"])
+                continue
+            elif kind == "session.status":
+                state = props["status"]["type"]
+                if state not in ("busy", "idle"):
+                    continue
+                kind = "session.execution.started" if state == "busy" else "session.execution.succeeded"
+            elif kind == "session.error":
+                kind = "session.execution.failed"
+                data["error"] = props["error"]["data"]
+            elif kind == "message.part.updated":
+                part = props["part"]
+                if part.get("messageID") in user_messages:
+                    continue
+                data.update(assistantMessageID=part["messageID"], ordinal=part["id"])
+                part_types[part["id"]] = part["type"]
+                if part["type"] == "tool":
+                    state = part["state"]
+                    data.update(id=part["id"], name="shell", input=state.get("input"),
+                                content=[{"type": "text", "text": state.get("output", "")}])
+                    kind = {"pending": "session.tool.input.started", "running": "session.tool.called",
+                            "completed": "session.tool.success"}[state["status"]]
+                else:
+                    data["text"] = part.get("text", "")
+                    phase = "ended" if data["text"] else "started"
+                    kind = f"session.{part['type']}.{phase}"
+            elif kind == "message.part.delta":
+                part_id = props["partID"]
+                kind = f"session.{part_types.get(part_id, 'text')}.delta"
+                data.update(assistantMessageID=props["messageID"], ordinal=part_id, delta=props["delta"])
+            elif kind == "permission.asked":
+                data["id"] = props["id"]
+            else:
+                continue
+            yield {"type": kind, "data": data}

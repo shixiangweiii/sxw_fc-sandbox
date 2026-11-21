@@ -105,6 +105,7 @@ def make_proxy() -> Optional[str]:
 
 
 class AgentHttpClient:
+    events_path = "/event"
     def __init__(
         self,
         endpoint: str,
@@ -135,7 +136,8 @@ class AgentHttpClient:
         )
 
     async def _request(
-        self, method: str, path: str, *, json_body: Any = None, idempotent: bool, slow: bool = False
+        self, method: str, path: str, *, json_body: Any = None, idempotent: bool,
+        slow: bool = False, params: Optional[dict] = None,
     ) -> httpx.Response:
         retry_on = _IDEMPOTENT_ERRORS if idempotent else _CONNECT_ERRORS
         timeout = self._slow_timeout if slow else httpx.USE_CLIENT_DEFAULT
@@ -143,7 +145,8 @@ class AgentHttpClient:
         for delay in (*_RETRY_DELAYS, None):
             try:
                 resp = await self._http.request(
-                    method, path, params=self._params, json=json_body, extensions=self._ext, timeout=timeout
+                    method, path, params=self._params if params is None else params,
+                    json=json_body, extensions=self._ext, timeout=timeout
                 )
             except retry_on as e:
                 last = e
@@ -213,7 +216,7 @@ class AgentHttpClient:
         for delay in (*_RETRY_DELAYS, None):
             try:
                 async with self._http.stream(
-                    "GET", "/event", params=self._params, timeout=self._sse_timeout, extensions=self._ext
+                    "GET", self.events_path, params=self._params, timeout=self._sse_timeout, extensions=self._ext
                 ) as resp:
                     if resp.status_code >= 400:
                         body = (await resp.aread())[:300]

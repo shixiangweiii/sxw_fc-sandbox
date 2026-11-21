@@ -100,6 +100,8 @@ class PoolConfig:
     # 独立的池名：agent 沙箱的库记录与云端元数据 pool 都用它，与代码执行池互不影响
     agent_pool_name: str = "agents"
     # opencode 引擎的模板（第二代运行时，见 scripts/build_opencode_template.py），配了即启用
+    agent_opencode2_template: str = ""
+    agent_pi1_template: str = ""
     agent_template: str = ""
     agent_port: int = 4096
     agent_workdir: str = "/home/user/workspace"

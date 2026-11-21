@@ -463,7 +463,11 @@ class E2BProvider:
                     log.info("write %s to %s failed (%r), retrying in %.1fs", path, sandbox_id, e, delay)
                     await asyncio.sleep(delay)
 
-    def app_client(self, endpoint, access_token, directory, *, ingress_ip):
+    def app_client(self, endpoint, access_token, directory, *, ingress_ip, protocol="opencode"):
+        if protocol == "opencode2":
+            from sandbox_pool.agent.engines.opencode_v2 import V2Client
+            return V2Client(endpoint, access_token, directory, ingress_ip=ingress_ip)
+
         from sandbox_pool.agent.opencode import AgentHttpClient
 
         return AgentHttpClient(endpoint, access_token, directory, ingress_ip=ingress_ip)

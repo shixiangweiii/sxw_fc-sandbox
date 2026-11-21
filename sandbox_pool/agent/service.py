@@ -66,9 +66,10 @@ def check_agent_config(cfg: PoolConfig) -> None:
     if not cfg.agent_enabled:
         return
     errors = []
-    if not cfg.agent_template and not cfg.agent_pi_template:
+    if not any(e.enabled for e in build_engines(cfg).values()):
         errors.append(
-            "POOL_AGENT_TEMPLATE (opencode) or POOL_AGENT_PI_TEMPLATE (pi) is required "
+            "at least one agent template is required (POOL_AGENT_TEMPLATE, POOL_AGENT_PI_TEMPLATE, "
+            "POOL_AGENT_OPENCODE2_TEMPLATE or POOL_AGENT_PI1_TEMPLATE) "
             "(see scripts/build_opencode_template.py, scripts/build_pi_template.py)"
         )
     enabled = [n for n, e in build_engines(cfg).items() if e.enabled]
@@ -210,9 +211,10 @@ class AgentService:
     def client_for(self, row: dict):
         client = self._clients.get(row["id"])
         if client is None:
-            client = self.provider.app_client(
-                row["endpoint"], row["access_token"], self.cfg.agent_workdir, ingress_ip=self.cfg.agent_ingress_ip or None
-            )
+            opts = {"ingress_ip": self.cfg.agent_ingress_ip or None}
+            if row.get("engine") == "opencode2":
+                opts["protocol"] = "opencode2"
+            client = self.provider.app_client(row["endpoint"], row["access_token"], self.cfg.agent_workdir, **opts)
             self._clients[row["id"]] = client
         return client
 
@@ -404,6 +406,11 @@ class AgentService:
                 await self._kill_quietly(app.sandbox_id)
                 return
             row = {**row, **values}
+            if engine.name == "opencode2":
+                from sandbox_pool.agent.engines.opencode_v2 import server_password
+                await self.provider.write_files(provider_id, {
+                    "/home/user/.agent/server-password": server_password(app.access_token).encode()
+                }, sandbox_timeout_s=timeout)
             client = self.client_for(row)
             await self._wait_healthy(client, timeout_s=self.cfg.agent_boot_timeout_s / 2)
             fresh_agent = await self.store.get_agent_by_id(agent["id"]) or agent

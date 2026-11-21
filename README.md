@@ -21,6 +21,7 @@
   - 出网策略可配置，业务系统和 agent 都能读到当前策略；
   - 模型与 MCP 的 Key 由平台在出网时注入，不进沙箱；
   - 按 Eco 规则设计：沙箱最长 24h，自动轮换，支持空闲销毁。
+  - 新版研究模板支持 OpenCode 2.3.2（`opencode2`）和 Pi 1.6.0（`pi1`），分别通过 `POOL_AGENT_OPENCODE2_TEMPLATE` 与 `POOL_AGENT_PI1_TEMPLATE` 启用。模板 ID、构建命令和验证范围见[升级验证记录](sxw_aicoding/方案设计/2026-11-21-OpenCode2与Pi1云沙箱升级验证.md)。
   - 接入方式见 [业务接入使用手册](sxw_aicoding/2026-09-25-opencode常驻agent-业务接入使用手册.md)。
 
 ## 架构

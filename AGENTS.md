@@ -94,6 +94,7 @@
 
 - opencode 运行 `opencode serve`；pi 通过 `pi-bridge.mjs` 提供同构控制接口，每个会话运行一个 `pi --mode rpc` 子进程。事件翻译和结果判定留在 Python 引擎层，桥接进程保持协议转发与进程管理职责。
 - 引擎选择存于 `agents.settings.engine`，未设置时用 `POOL_AGENT_DEFAULT_ENGINE`；沙箱实际引擎存于 `sandboxes.engine`，历史 NULL 记录按 opencode 处理。访问、接管和健康检查已有沙箱时按沙箱记录选择引擎。
+- 新建研究模板走 `scripts/build_agent_research_template.py`，版本化引擎 `opencode2`、`pi1` 分别使用 `POOL_AGENT_OPENCODE2_TEMPLATE`、`POOL_AGENT_PI1_TEMPLATE`。OpenCode 2 的实例探活使用带 Basic Auth 的 `/api/info`；Pi 1 的 MCP 为内置能力。见[本机和云端升级验证](sxw_aicoding/方案设计/2026-11-21-OpenCode2与Pi1云沙箱升级验证.md)。
 - `POOL_AGENT_TEMPLATE` 启用 opencode，`POOL_AGENT_PI_TEMPLATE` 启用 pi。`GET /v1/agent-engines` 返回已启用引擎；默认引擎必须已启用。
 - 切换引擎等于轮换沙箱：运行中的旧任务继续跟进，新会话进入新引擎；旧引擎的 `session_id` 续聊返回 409，不迁移会话。创建或退役沙箱前保留对最新 agent 设置的复核（PI-L1）。
 - pi 不支持对话接口的 `agent` 参数，传入返回 400；不要伪装成具备 opencode 的 `build/plan` 能力。

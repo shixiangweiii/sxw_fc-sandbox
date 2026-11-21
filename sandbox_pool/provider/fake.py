@@ -21,7 +21,7 @@ from sandbox_pool.provider.base import (
     SandboxNotFound,
     cap_text,
 )
-from sandbox_pool.provider.fake_opencode import FakeOpencodeClient, FakeOpencodeServer
+from sandbox_pool.provider.fake_opencode import FakeOpencodeClient, FakeOpencodeServer, FakeOpencodeV2Client
 from sandbox_pool.provider.fake_pi import FakePiClient, FakePiServer
 
 
@@ -239,7 +239,7 @@ class FakeProvider:
         sb = self.sandboxes[sid]
         sb["network"] = json.loads(json.dumps(network))
         sb["access_token"] = uuid.uuid4().hex
-        if template in self.pi_templates:
+        if template in self.pi_templates or metadata.get("engine") == "pi1":
             sb["pi"] = FakePiServer(sb["files"])
         else:
             sb["opencode"] = FakeOpencodeServer(sb["files"])
@@ -266,12 +266,14 @@ class FakeProvider:
         for path, data in files.items():
             sb["files"][path] = bytes(data)
 
-    def app_client(self, endpoint, access_token, directory, *, ingress_ip):
+    def app_client(self, endpoint, access_token, directory, *, ingress_ip, protocol="opencode"):
         # endpoint 形如 https://4096-<sandbox_id>.fake.local
         sandbox_id = endpoint.split("://", 1)[1].split(".", 1)[0].split("-", 1)[1]
         sb = self.sandboxes.get(sandbox_id) or {}
         if sb.get("pi") is not None:
             return FakePiClient(self, sandbox_id, access_token, directory)
+        if protocol == "opencode2":
+            return FakeOpencodeV2Client(self, sandbox_id, access_token, directory)
         return FakeOpencodeClient(self, sandbox_id, access_token, directory)
 
     def opencode(self, sandbox_id: str) -> FakeOpencodeServer:

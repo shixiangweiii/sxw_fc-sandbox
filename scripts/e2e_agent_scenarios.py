@@ -102,6 +102,8 @@ class Api:
 
 
 def tool_output(res: dict, tool: str) -> str:
+    if tool == "bash" and ENGINE["name"] == "opencode2":
+        tool = "shell"
     return "\n".join((t.get("output") or "") for t in res["tools"] if t["tool"] == tool and t["status"] == "completed")
 
 
@@ -125,9 +127,9 @@ async def s1(api: Api, ctx: dict) -> None:
 async def s2(api: Api, ctx: dict) -> None:
     res = await api.stream_message("用 bash 工具执行 `python3 -c 'print(6*7)'`，然后只回复输出结果。")
     check("S2", "42" in tool_output(res, "bash"), tool="bash", total_s=res.get("total_s"), answer=res["text"][:80])
-    if ENGINE["name"] == "pi":
-        # pi 没有 webfetch 工具，按 AGENTS.md 的说明用 bash + curl 抓网页
-        res = await api.stream_message("抓取 https://www.example.com 的网页内容，告诉我页面标题。")
+    if ENGINE["name"] in ("pi", "pi1", "opencode2"):
+        # 这些引擎用 shell + curl 核验外网，检查真实工具输出。
+        res = await api.stream_message("用 shell 工具执行 curl -fsSL https://www.example.com，告诉我页面标题。")
         check("S2", "Example Domain" in tool_output(res, "bash") and "Example Domain" in res["text"], tool="bash+curl",
               total_s=res.get("total_s"), answer=res["text"][:80])
     else:
@@ -357,6 +359,43 @@ async def s12(api: Api, ctx: dict) -> None:
           and [s["engine"] for s in info["sandboxes"] if s["state"] == "ACTIVE"] == [first], switched_back_to=first)
 
 
+async def s13(api: Api, other: Api) -> None:
+    """可选的跨大版本轮换：使用同一用户，切换和回退期间让已受理的任务继续执行。"""
+    target = ENGINE["name"]
+    previous = {"opencode2": "opencode", "pi1": "pi"}[target]
+    path = f"/v1/agents/{USER}"
+
+    async def select(name):
+        response = await api.req("PATCH", path + "/settings", json={"engine": name})
+        response.raise_for_status()
+
+    async def start_job(tag):
+        res = await api.stream_message(
+            f"务必用 shell 工具执行 sleep 20 && echo {tag}，等待命令结束并只回复输出。",
+            stop_after_start=True,
+        )
+        return res["start"]
+
+    await select(previous)
+    old = await start_job("old-task-ok")
+    await select(target)
+    new = await start_job("new-task-ok")
+    old_state = (await other.req("GET", path + "/tasks/" + old["task_id"])).json()["state"]
+    check("S13", old_state == "RUNNING" and old["sandbox_id"] != new["sandbox_id"],
+          previous_engine=previous, upgraded_engine=target, old_state_at_new_start=old_state)
+
+    await select(previous)
+    new_state = (await other.req("GET", path + "/tasks/" + new["task_id"])).json()["state"]
+    check("S13", new_state == "RUNNING", new_state_at_rollback=new_state)
+    res = await api.stream_message("只回复 rollback-ok，不使用工具。")
+    check("S13", res.get("done", {}).get("state") == "SUCCEEDED" and "rollback-ok" in res["text"],
+          rollback_engine=(await other.req("GET", path)).json()["engine"])
+    for job, tag in [(old, "old-task-ok"), (new, "new-task-ok")]:
+        final = await other.wait_task(job["task_id"], timeout=90)
+        check("S13", final["state"] == "SUCCEEDED" and tag in (final["result"] or ""),
+              task=tag, final_state=final["state"])
+
+
 def read_pids() -> dict:
     path = ROOT / ".data" / "cluster.pids"
     out = {}
@@ -372,7 +411,7 @@ async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", help="逗号分隔的场景编号，如 S1,S2")
     ap.add_argument("--replicas", default="8001,8002")
-    ap.add_argument("--engine", help="测试用户使用的引擎（opencode / pi），不传用服务端默认")
+    ap.add_argument("--engine", help="测试用户使用的引擎（opencode / pi / opencode2 / pi1），不传用服务端默认")
     args = ap.parse_args()
     only = set((args.only or "").upper().split(",")) - {""}
     ports = [int(p) for p in args.replicas.split(",")]
@@ -398,6 +437,8 @@ async def main() -> int:
         ("S9", lambda: s9(b, ctx)), ("S10", lambda: s10(a, ctx, b, read_pids())), ("S12", lambda: s12(b, ctx)),
         ("S11", lambda: s11(b, admin)),
     ]
+    if "S13" in only:
+        steps.insert(-1, ("S13", lambda: s13(a, b)))
     try:
         for name, fn in steps:
             if only and name not in only:

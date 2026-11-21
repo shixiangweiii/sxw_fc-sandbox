@@ -6,9 +6,10 @@
 
 from sandbox_pool.agent.engines.base import Engine, FilesContext
 from sandbox_pool.agent.engines.opencode import OpencodeEngine
-from sandbox_pool.agent.engines.pi import THINKING_LEVELS, PiEngine
+from sandbox_pool.agent.engines.opencode_v2 import OpencodeV2Engine
+from sandbox_pool.agent.engines.pi import THINKING_LEVELS, PiEngine, PiNativeEngine
 
-ENGINE_NAMES = ("opencode", "pi")
+ENGINE_NAMES = ("opencode", "pi", "opencode2", "pi1")
 # 老的沙箱记录没有 engine 列的值
 LEGACY_ENGINE = "opencode"
 
@@ -18,6 +19,19 @@ __all__ = ["ENGINE_NAMES", "LEGACY_ENGINE", "THINKING_LEVELS", "Engine", "FilesC
 def build_engines(cfg) -> dict[str, Engine]:
     """全部引擎（含未启用的：老沙箱记录可能属于已停用的引擎，仍要能访问、销毁它）。"""
     return {
+        "opencode2": OpencodeV2Engine(
+            template=cfg.agent_opencode2_template,
+            port=cfg.agent_port,
+            model=cfg.agent_model,
+            workdir=cfg.agent_workdir,
+        ),
+        "pi1": PiNativeEngine(
+            template=cfg.agent_pi1_template,
+            port=cfg.agent_pi_port,
+            model=cfg.agent_pi_model,
+            workdir=cfg.agent_workdir,
+            thinking=cfg.agent_pi_thinking,
+        ),
         "opencode": OpencodeEngine(
             template=cfg.agent_template, port=cfg.agent_port, model=cfg.agent_model, workdir=cfg.agent_workdir
         ),

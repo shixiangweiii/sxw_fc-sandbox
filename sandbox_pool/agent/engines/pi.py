@@ -228,8 +228,11 @@ class PiEngine(Engine):
     def last_prompt_key(self, messages: list[dict]) -> Optional[str]:
         return last_prompt_key(messages)
 
+    def render_mcp(self, mcp):
+        return mcp_servers(mcp)
+
     def render_files(self, ctx: FilesContext) -> dict[str, bytes]:
-        servers = mcp_servers(ctx.mcp)
+        servers = self.render_mcp(ctx.mcp)
         provider, _, model = self.model.partition("/")
         config = {"provider": provider, "model": model, "thinking": self.thinking or None, "mcp": bool(servers)}
         return {
@@ -252,3 +255,15 @@ class PiEngine(Engine):
         d["thinking"] = self.thinking or None
         d["capabilities"].update(webfetch_tool=False, permission_prompts=False, reload_keeps_running_tasks=True)
         return d
+
+
+class PiNativeEngine(PiEngine):
+    """Pi 1.x 使用内置 MCP 并显式暴露搜索工具。"""
+    name = "pi1"
+
+    def render_mcp(self, mcp):
+        servers = mcp_servers(mcp)
+        for item in servers.values():
+            item.pop("directTools")
+            item["exposure"] = "direct"
+        return servers

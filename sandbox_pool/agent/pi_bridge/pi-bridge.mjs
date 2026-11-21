@@ -19,7 +19,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
-const VERSION = "0.1.2";
+const VERSION = "0.2.0";
 const env = process.env;
 const num = (v, d) => (v !== undefined && v !== "" && Number.isFinite(Number(v)) ? Number(v) : d);
 
@@ -216,7 +216,12 @@ async function startProc(s) {
   if (cfg.model) args.push("--model", String(cfg.model));
   if (cfg.thinking) args.push("--thinking", String(cfg.thinking));
   // 只加载显式指定的扩展，忽略项目级 .pi/ 资源，不做自动联网（版本检查、模型目录刷新）
-  args.push("-ne");
+  if (env.PI_NATIVE_MCP === "1") {
+    // Pi 1.x 将 MCP 作为内置扩展；-na 继续屏蔽项目资源。
+    if (!cfg.mcp) args.push("--no-mcp");
+  } else {
+    args.push("-ne");
+  }
   if (cfg.mcp && CONF.mcpExtension) args.push("-e", CONF.mcpExtension);
   args.push("-na", "--offline");
   fs.mkdirSync(CONF.sessionDir, { recursive: true });

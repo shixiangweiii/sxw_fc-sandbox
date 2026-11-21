@@ -6,6 +6,9 @@
 
 业务调用从第 2、3.4、4、5 节开始；部署与运维参阅第 3.1–3.3、6–9 节；引擎选择见第 10 节。
 
+2026-11-21 新增研究引擎。部署端用 `POOL_AGENT_OPENCODE2_TEMPLATE` 和 `POOL_AGENT_PI1_TEMPLATE` 指定各自模板，将 `POOL_AGENT_DEFAULT_ENGINE` 设为已启用的引擎。业务端从 `GET /v1/agent-engines` 读取可用列表，设置中的引擎名分别为 `opencode2` 和 `pi1`。OpenCode 2 的 shell 工具名为 `shell`，Pi 1 的百炼原生工具名为 `mcp__websearch__bailian_web_search`。接口仍通过 `tool` 事件报告真实工具名。完整配置和验证见[新版研究模板记录](方案设计/2026-11-21-OpenCode2与Pi1云沙箱升级验证.md)。
+
+
 ## 1. 这是什么
 
 沙箱池服务按 **`(client_id, user_id)` 提供常驻 agent**，其中 `client_id` 是调用方 API Key 的名称。引擎可选 opencode（默认）或 pi，由接入方按用户选择。agent 运行在阿里云云沙箱里：
